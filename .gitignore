@@ -1,3 +1,7 @@
+# real credentials — .env.example is the tracked template
+.env
+.env.local
+
 # dispatch local state: contextual-chunk cache, persisted memory, indexes
 .dispatch/
 

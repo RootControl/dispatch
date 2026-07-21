@@ -3,7 +3,8 @@
 //	dispatch ingest --corpus ./testdata/corpus [--dry-run]
 //	dispatch ask [--trace] "your question"
 //
-// Configuration comes from the environment:
+// Configuration comes from a .env file in the working directory, or from the
+// environment directly (shell variables take precedence). See .env.example.
 //
 //	LLM_BASE_URL    OpenAI-compatible endpoint (required)
 //	LLM_API_KEY     bearer token
@@ -24,6 +25,7 @@ import (
 	"github.com/RootControl/dispatch/agent"
 	"github.com/RootControl/dispatch/core"
 	"github.com/RootControl/dispatch/index"
+	"github.com/RootControl/dispatch/internal/envfile"
 	"github.com/RootControl/dispatch/llm"
 	"github.com/RootControl/dispatch/router"
 	"github.com/RootControl/dispatch/tiers"
@@ -32,9 +34,16 @@ import (
 const (
 	defaultIndexPath = ".dispatch/index.json"
 	defaultCacheDir  = ".dispatch/cache"
+	envPath          = ".env"
 )
 
 func main() {
+	// Load .env before anything reads configuration. Shell variables already set
+	// take precedence over the file.
+	if err := envfile.Load(envPath); err != nil {
+		fmt.Fprintf(os.Stderr, "dispatch: reading %s: %v\n", envPath, err)
+		os.Exit(1)
+	}
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -58,10 +67,10 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `dispatch — agentic tiered retrieval
 
-  dispatch ingest --corpus DIR [--dry-run] [--no-context]
-  dispatch ask [--trace] [-k N] "question"
+  dispatch ingest --corpus DIR [--dry-run] [--no-context] [--chunk-tokens N]
+  dispatch ask [--trace] [--retrieve-only] [-k N] "question"
 
-Set LLM_BASE_URL and LLM_API_KEY first.
+Configure first:  cp .env.example .env  and fill in LLM_BASE_URL / LLM_API_KEY.
 `)
 }
 

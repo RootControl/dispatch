@@ -35,6 +35,7 @@ type Config struct {
 	Chunk         ChunkOptions // splitter tuning
 	Contextualize bool         // run the contextual-chunking LLM pass on ingest
 	CacheTag      string       // model identity folded into cache keys; default "default"
+	EmbedTag      string       // embedding-model identity recorded in saved indexes
 	Parallelism   int          // concurrent context-sentence calls; default 4
 }
 

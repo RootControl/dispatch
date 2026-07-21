@@ -76,6 +76,12 @@ func New(cfg Config) (*Client, error) {
 	}, nil
 }
 
+// ChatModel and EmbedModel report the resolved model names. Callers use these to
+// tag caches and saved indexes so a model swap invalidates derived data rather
+// than silently reusing it.
+func (c *Client) ChatModel() string  { return c.cfg.ChatModel }
+func (c *Client) EmbedModel() string { return c.cfg.EmbedModel }
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

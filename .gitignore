@@ -1,0 +1,10 @@
+# dispatch local state: contextual-chunk cache, persisted memory, indexes
+.dispatch/
+
+# built binaries
+/dispatch
+/cmd/dispatch/dispatch
+
+# go
+*.test
+*.out

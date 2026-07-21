@@ -11,6 +11,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/RootControl/dispatch/llm"
 )
@@ -80,7 +81,13 @@ func (f *LLM) Embed(ctx context.Context, inputs []string) ([][]float64, error) {
 
 func embed(text string, dims int) []float64 {
 	v := make([]float64, dims)
-	for tok := range strings.FieldsSeq(strings.ToLower(text)) {
+	// Split on non-alphanumeric runes, not whitespace: otherwise "budget." and
+	// "budget" would hash to different dimensions and never reinforce each
+	// other, an artifact no real tokenizer has.
+	toks := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+	})
+	for _, tok := range toks {
 		h := fnv.New32a()
 		_, _ = h.Write([]byte(tok))
 		v[h.Sum32()%uint32(dims)] += 1

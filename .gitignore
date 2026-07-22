@@ -12,3 +12,6 @@
 # go
 *.test
 *.out
+
+# macOS
+.DS_Store

@@ -35,7 +35,10 @@ const (
 	defaultIndexPath = ".dispatch/index.json"
 	defaultCacheDir  = ".dispatch/cache"
 	defaultMemoryDir = ".dispatch/memory"
-	envPath          = ".env"
+	// defaultHierarchyPath holds the RAPTOR tree, written by `ingest --hierarchy`
+	// and registered by `ask` when present.
+	defaultHierarchyPath = ".dispatch/hierarchy.json"
+	envPath              = ".env"
 )
 
 func main() {
@@ -68,7 +71,7 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `dispatch — agentic tiered retrieval
 
-  dispatch ingest --corpus DIR [--dry-run] [--no-context] [--chunk-tokens N]
+  dispatch ingest --corpus DIR [--dry-run] [--no-context] [--chunk-tokens N] [--hierarchy]
   dispatch ask [--trace] [--retrieve-only] [-k N] [--max-steps N] [--remember] "question"
 
 Configure first:  cp .env.example .env  and fill in LLM_BASE_URL / LLM_API_KEY.
@@ -100,6 +103,8 @@ func runIngest(args []string) error {
 	dryRun := fs.Bool("dry-run", false, "report chunk count and expected LLM calls, then stop")
 	noContext := fs.Bool("no-context", false, "skip contextual chunking (cheaper, worse retrieval)")
 	chunkTokens := fs.Int("chunk-tokens", 0, "target chunk size in tokens (0 = default 800)")
+	hierarchy := fs.Bool("hierarchy", false, "also build the RAPTOR summary tree for the hierarchical tier")
+	branching := fs.Int("branching", 5, "leaves per cluster when building the hierarchy")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -136,6 +141,21 @@ func runIngest(args []string) error {
 	fmt.Printf("ingested %d docs -> %d chunks (%d context calls, %d cache hits)\n",
 		stats.Docs, stats.Chunks, stats.LLMCalls, stats.CacheHits)
 	fmt.Printf("index written to %s\n", *indexPath)
+
+	// The tree is opt-in: it costs roughly one LLM call per cluster per level on
+	// top of ingestion, and is only useful for corpus-wide questions.
+	if *hierarchy {
+		h, hstats, err := tiers.BuildHierarchy(context.Background(), client, store,
+			tiers.HierarchyOptions{Branching: *branching})
+		if err != nil {
+			return err
+		}
+		if err := h.Save(defaultHierarchyPath); err != nil {
+			return err
+		}
+		fmt.Printf("hierarchy: %d levels, %d summaries (%d LLM calls) -> %s\n",
+			hstats.Levels, hstats.Summaries, hstats.LLMCalls, defaultHierarchyPath)
+	}
 	return nil
 }
 
@@ -167,6 +187,16 @@ func runAsk(args []string) error {
 	// the remaining three tiers land in later milestones.
 	registry := map[core.Tier]core.Retriever{
 		core.TierSemantic: tiers.NewSemantic(store),
+	}
+
+	// The hierarchical tier registers itself only if a tree was built. Absence is
+	// normal, not an error — `ingest --hierarchy` is opt-in.
+	if _, err := os.Stat(defaultHierarchyPath); err == nil {
+		h, err := tiers.LoadHierarchy(client, defaultHierarchyPath)
+		if err != nil {
+			return fmt.Errorf("load hierarchy: %w", err)
+		}
+		registry[core.TierHierarchical] = h
 	}
 
 	// Memory is opt-in: it costs an extra LLM call per question and writes to

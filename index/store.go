@@ -223,6 +223,33 @@ func (s *Store) Len() int {
 	return len(s.chunks)
 }
 
+// Entries returns the indexed chunks and their vectors, in index order and
+// aligned by position. It lets callers reuse embeddings that were already paid
+// for — the hierarchical tier clusters leaf vectors rather than re-embedding
+// the whole corpus.
+func (s *Store) Entries() ([]core.Chunk, [][]float64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	chunks := make([]core.Chunk, 0, len(s.vec.ids))
+	vectors := make([][]float64, 0, len(s.vec.ids))
+	for i, id := range s.vec.ids {
+		chunks = append(chunks, s.chunks[id])
+		vectors = append(vectors, s.vec.vecs[i])
+	}
+	return chunks, vectors
+}
+
+// Add indexes a chunk whose embedding the caller already has. The vector must be
+// unit-normalized and from the same embedding model as the rest of the store;
+// nothing here can check that, so callers own it.
+func (s *Store) Add(c core.Chunk, vector []float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.chunks[c.ID] = c
+	s.vec.add(c.ID, vector)
+	s.bm.add(c.ID, c.Embedded())
+}
+
 // forEachLimited runs fn for indices 0..n-1 with at most limit concurrent
 // goroutines, returning the first error and cancelling the rest.
 func forEachLimited(ctx context.Context, n, limit int, fn func(ctx context.Context, i int) error) error {

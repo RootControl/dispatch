@@ -38,7 +38,9 @@ const (
 	// defaultHierarchyPath holds the RAPTOR tree, written by `ingest --hierarchy`
 	// and registered by `ask` when present.
 	defaultHierarchyPath = ".dispatch/hierarchy.json"
-	envPath              = ".env"
+	// defaultGraphPath holds the entity graph, written by `ingest --graph`.
+	defaultGraphPath = ".dispatch/graph.json"
+	envPath          = ".env"
 )
 
 func main() {
@@ -71,7 +73,7 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `dispatch — agentic tiered retrieval
 
-  dispatch ingest --corpus DIR [--dry-run] [--no-context] [--chunk-tokens N] [--hierarchy]
+  dispatch ingest --corpus DIR [--dry-run] [--no-context] [--chunk-tokens N] [--hierarchy] [--graph]
   dispatch ask [--trace] [--retrieve-only] [-k N] [--max-steps N] [--remember] "question"
 
 Configure first:  cp .env.example .env  and fill in LLM_BASE_URL / LLM_API_KEY.
@@ -105,6 +107,7 @@ func runIngest(args []string) error {
 	chunkTokens := fs.Int("chunk-tokens", 0, "target chunk size in tokens (0 = default 800)")
 	hierarchy := fs.Bool("hierarchy", false, "also build the RAPTOR summary tree for the hierarchical tier")
 	branching := fs.Int("branching", 5, "leaves per cluster when building the hierarchy")
+	graph := fs.Bool("graph", false, "also build the entity graph for the relational tier")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -156,6 +159,23 @@ func runIngest(args []string) error {
 		fmt.Printf("hierarchy: %d levels, %d summaries (%d LLM calls) -> %s\n",
 			hstats.Levels, hstats.Summaries, hstats.LLMCalls, defaultHierarchyPath)
 	}
+
+	// Also opt-in: extraction is one LLM call per chunk, cached by content hash
+	// so a rebuild over unchanged documents is free.
+	if *graph {
+		rel, gstats, err := tiers.BuildGraph(context.Background(), client, store, tiers.GraphOptions{
+			Cache:    index.NewCache(defaultCacheDir),
+			CacheTag: client.ChatModel(),
+		})
+		if err != nil {
+			return err
+		}
+		if err := rel.Save(defaultGraphPath); err != nil {
+			return err
+		}
+		fmt.Printf("graph: %d entities, %d relations (%d LLM calls, %d cache hits) -> %s\n",
+			gstats.Entities, gstats.Relations, gstats.LLMCalls, gstats.CacheHits, defaultGraphPath)
+	}
 	return nil
 }
 
@@ -167,6 +187,7 @@ func runAsk(args []string) error {
 	retrieveOnly := fs.Bool("retrieve-only", false, "print evidence without running the loop")
 	maxSteps := fs.Int("max-steps", 3, "maximum retrieve/judge rounds")
 	remember := fs.Bool("remember", false, "search memory, and write back a takeaway after answering")
+	maxHops := fs.Int("max-hops", 2, "relational graph traversal depth")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -197,6 +218,15 @@ func runAsk(args []string) error {
 			return fmt.Errorf("load hierarchy: %w", err)
 		}
 		registry[core.TierHierarchical] = h
+	}
+
+	// Likewise the relational tier: present only if `ingest --graph` was run.
+	if _, err := os.Stat(defaultGraphPath); err == nil {
+		rel, err := tiers.LoadGraph(defaultGraphPath, *maxHops)
+		if err != nil {
+			return fmt.Errorf("load graph: %w", err)
+		}
+		registry[core.TierRelational] = rel
 	}
 
 	// Memory is opt-in: it costs an extra LLM call per question and writes to

@@ -29,6 +29,13 @@ type Loop struct {
 	MaxSteps    int // retrieve/judge rounds; default 3
 	TopK        int // results per tier per round; default 5
 	MaxEvidence int // evidence items carried into generation; default 12
+
+	// Memory, when set, puts the core block in the generation prompt. Register
+	// it in Retrievers as well to let the loop search archival memory.
+	Memory *Memory
+	// WriteBack extracts a durable takeaway after answering and stores it.
+	// Costs one extra LLM call per question.
+	WriteBack bool
 }
 
 func (l *Loop) defaults() (maxSteps, topK, maxEvidence int) {
@@ -54,10 +61,22 @@ func (l *Loop) Run(ctx context.Context, question string) (Answer, error) {
 	if err != nil {
 		return Answer{}, fmt.Errorf("agent: route: %w", err)
 	}
-	tr.add(Step{Kind: StepRoute, Tiers: decision.Tiers, Detail: decision.Reason})
+	tierSet := decision.Tiers
+	reason := decision.Reason
+
+	// Memory is always worth consulting when registered. A keyword router cannot
+	// know what is in memory, so leaving this to routing means archival memory is
+	// searched only by luck — and the whole point of write-back is that earlier
+	// work informs later questions.
+	if l.Memory != nil {
+		if _, ok := l.Retrievers[core.TierMemory]; ok && !slices.Contains(tierSet, core.TierMemory) {
+			tierSet = append(tierSet, core.TierMemory)
+			reason += "; memory always consulted"
+		}
+	}
+	tr.add(Step{Kind: StepRoute, Tiers: tierSet, Detail: reason})
 
 	query := question
-	tierSet := decision.Tiers
 	var evidence []core.Result
 
 	for step := 1; step <= maxSteps; step++ {
@@ -99,13 +118,34 @@ func (l *Loop) Run(ctx context.Context, question string) (Answer, error) {
 		return Answer{Trace: tr}, fmt.Errorf("agent: no evidence retrieved for %q", question)
 	}
 
+	var memoryBlock string
+	if l.Memory != nil {
+		memoryBlock = l.Memory.CoreBlock()
+	}
+
 	start := time.Now()
-	text, err := Generate(ctx, l.LLM, question, evidence)
+	text, err := generate(ctx, l.LLM, question, memoryBlock, evidence)
 	tr.Calls++
 	tr.add(Step{Kind: StepGenerate, Results: len(evidence), Elapsed: time.Since(start)})
 	if err != nil {
 		return Answer{Trace: tr}, err
 	}
+
+	// Write-back is best-effort: a failure here means the next session starts
+	// colder, not that this answer is wrong, so it is recorded and not returned.
+	if l.Memory != nil && l.WriteBack {
+		takeaway, err := l.Memory.WriteBack(ctx, question, text)
+		tr.Calls++
+		switch {
+		case err != nil:
+			tr.add(Step{Kind: StepRemember, Detail: "failed: " + err.Error()})
+		case takeaway == "":
+			tr.add(Step{Kind: StepRemember, Detail: "nothing worth remembering"})
+		default:
+			tr.add(Step{Kind: StepRemember, Detail: truncate(takeaway, 70)})
+		}
+	}
+
 	return Answer{Text: text, Evidence: evidence, Trace: tr}, nil
 }
 

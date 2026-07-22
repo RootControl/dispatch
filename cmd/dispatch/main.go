@@ -34,6 +34,7 @@ import (
 const (
 	defaultIndexPath = ".dispatch/index.json"
 	defaultCacheDir  = ".dispatch/cache"
+	defaultMemoryDir = ".dispatch/memory"
 	envPath          = ".env"
 )
 
@@ -68,7 +69,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `dispatch — agentic tiered retrieval
 
   dispatch ingest --corpus DIR [--dry-run] [--no-context] [--chunk-tokens N]
-  dispatch ask [--trace] [--retrieve-only] [-k N] [--max-steps N] "question"
+  dispatch ask [--trace] [--retrieve-only] [-k N] [--max-steps N] [--remember] "question"
 
 Configure first:  cp .env.example .env  and fill in LLM_BASE_URL / LLM_API_KEY.
 `)
@@ -145,6 +146,7 @@ func runAsk(args []string) error {
 	trace := fs.Bool("trace", false, "show routing, retrieval, and judge steps")
 	retrieveOnly := fs.Bool("retrieve-only", false, "print evidence without running the loop")
 	maxSteps := fs.Int("max-steps", 3, "maximum retrieve/judge rounds")
+	remember := fs.Bool("remember", false, "search memory, and write back a takeaway after answering")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -166,6 +168,22 @@ func runAsk(args []string) error {
 	registry := map[core.Tier]core.Retriever{
 		core.TierSemantic: tiers.NewSemantic(store),
 	}
+
+	// Memory is opt-in: it costs an extra LLM call per question and writes to
+	// disk, neither of which should happen without being asked for.
+	var mem *agent.Memory
+	if *remember {
+		mem = agent.NewMemory(agent.MemoryConfig{
+			LLM:      client,
+			Dir:      defaultMemoryDir,
+			EmbedTag: client.EmbedModel(),
+		})
+		if err := mem.Load(); err != nil {
+			return fmt.Errorf("load memory: %w", err)
+		}
+		registry[core.TierMemory] = mem
+	}
+
 	available := make([]core.Tier, 0, len(registry))
 	for t := range registry {
 		available = append(available, t)
@@ -205,6 +223,8 @@ func runAsk(args []string) error {
 		Retrievers: registry,
 		MaxSteps:   *maxSteps,
 		TopK:       *topK,
+		Memory:     mem,
+		WriteBack:  *remember,
 	}
 	answer, err := loop.Run(ctx, question)
 	if err != nil {
@@ -212,6 +232,13 @@ func runAsk(args []string) error {
 			fmt.Fprintln(os.Stderr, answer.Trace)
 		}
 		return err
+	}
+	// Persist whatever was learned, even if nothing new was written back —
+	// eviction may still have moved entries into archival.
+	if mem != nil {
+		if err := mem.Save(); err != nil {
+			return fmt.Errorf("save memory: %w", err)
+		}
 	}
 	fmt.Println(answer.Text)
 	if *trace {

@@ -16,6 +16,7 @@ const (
 	StepRetrieve StepKind = "retrieve"
 	StepJudge    StepKind = "judge"
 	StepGenerate StepKind = "generate"
+	StepRemember StepKind = "remember"
 )
 
 // Step is one recorded action. Not every field applies to every kind; the

@@ -31,14 +31,24 @@ Rules:
 // Generate produces a cited answer from evidence. It is a single pass; the agent
 // loop calls it once retrieval is judged sufficient.
 func Generate(ctx context.Context, l llm.LLM, question string, evidence []core.Result) (string, error) {
+	return generate(ctx, l, question, "", evidence)
+}
+
+// generate is Generate plus an optional core-memory block. Memory is presented
+// separately from evidence and explicitly marked uncited: it is the agent's own
+// prior conclusion, not a retrieved source, and letting the model cite it would
+// manufacture citations that resolve to nothing.
+func generate(ctx context.Context, l llm.LLM, question, memoryBlock string, evidence []core.Result) (string, error) {
 	if len(evidence) == 0 {
 		return "", fmt.Errorf("agent: no evidence to answer from")
 	}
-	msgs := []llm.Message{
-		llm.System(generateSystem),
-		llm.User(fmt.Sprintf("<evidence>\n%s\n</evidence>\n\nQuestion: %s", FormatEvidence(evidence), question)),
+	var prompt strings.Builder
+	if memoryBlock != "" {
+		fmt.Fprintf(&prompt, "<memory>\nRemembered from earlier work. Useful for orientation, but NOT citable — cite only evidence.\n%s\n</memory>\n\n", memoryBlock)
 	}
-	return l.Chat(ctx, msgs)
+	fmt.Fprintf(&prompt, "<evidence>\n%s\n</evidence>\n\nQuestion: %s", FormatEvidence(evidence), question)
+
+	return l.Chat(ctx, []llm.Message{llm.System(generateSystem), llm.User(prompt.String())})
 }
 
 // FormatEvidence renders results as a citation-labeled block. The [tier:source]

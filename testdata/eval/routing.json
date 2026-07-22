@@ -1,0 +1,19 @@
+[
+  {"question": "Total on invoice 4471?", "expect": "structured", "note": "design doc example"},
+  {"question": "What does the corpus say about the billing migration?", "expect": "semantic", "note": "design doc example"},
+  {"question": "Who does Bob report to, and what did she sign?", "expect": "relational", "note": "design doc example"},
+  {"question": "Recurring themes across all docs?", "expect": "hierarchical", "note": "design doc example"},
+
+  {"question": "How many invoices are still open?", "expect": "structured"},
+  {"question": "What is the average line item amount?", "expect": "structured"},
+  {"question": "What is the approved budget figure?", "expect": "structured"},
+
+  {"question": "Explain the mitigation for the schedule risk.", "expect": "semantic"},
+  {"question": "What is out of scope for the project?", "expect": "semantic"},
+
+  {"question": "Which vendor does the statement mailer depend on?", "expect": "relational"},
+  {"question": "Who approved the contract renewal?", "expect": "relational"},
+
+  {"question": "What patterns show up across the whole document set?", "expect": "hierarchical"},
+  {"question": "Summarize what these documents say overall.", "expect": "hierarchical"}
+]

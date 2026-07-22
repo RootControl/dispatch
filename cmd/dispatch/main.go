@@ -60,6 +60,8 @@ func main() {
 		err = runIngest(os.Args[2:])
 	case "ask":
 		err = runAsk(os.Args[2:])
+	case "eval":
+		err = runEval(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -75,6 +77,7 @@ func usage() {
 
   dispatch ingest --corpus DIR [--dry-run] [--no-context] [--chunk-tokens N] [--hierarchy] [--graph]
   dispatch ask [--trace] [--retrieve-only] [-k N] [--max-steps N] [--remember] [--sql-dir DIR] "question"
+  dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]
 
 Configure first:  cp .env.example .env  and fill in LLM_BASE_URL / LLM_API_KEY.
 `)
@@ -189,6 +192,7 @@ func runAsk(args []string) error {
 	remember := fs.Bool("remember", false, "search memory, and write back a takeaway after answering")
 	maxHops := fs.Int("max-hops", 2, "relational graph traversal depth")
 	sqlDir := fs.String("sql-dir", "", "directory of CSV tables to enable the structured (text-to-SQL) tier")
+	llmRoute := fs.Bool("llm-router", false, "classify with the model instead of keywords (falls back to keywords on failure)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -266,8 +270,13 @@ func runAsk(args []string) error {
 
 	// --retrieve-only skips the loop entirely: route once, retrieve once, print.
 	// Useful for inspecting retrieval quality without paying for judge calls.
+	var route router.Router = router.Heuristic{Available: available}
+	if *llmRoute {
+		route = router.LLM{LLM: client, Available: available}
+	}
+
 	if *retrieveOnly {
-		decision, err := router.Heuristic{Available: available}.Route(ctx, question)
+		decision, err := route.Route(ctx, question)
 		if err != nil {
 			return err
 		}
@@ -291,7 +300,7 @@ func runAsk(args []string) error {
 
 	loop := &agent.Loop{
 		LLM:        client,
-		Router:     router.Heuristic{Available: available},
+		Router:     route,
 		Retrievers: registry,
 		MaxSteps:   *maxSteps,
 		TopK:       *topK,

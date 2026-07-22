@@ -74,7 +74,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `dispatch — agentic tiered retrieval
 
   dispatch ingest --corpus DIR [--dry-run] [--no-context] [--chunk-tokens N] [--hierarchy] [--graph]
-  dispatch ask [--trace] [--retrieve-only] [-k N] [--max-steps N] [--remember] "question"
+  dispatch ask [--trace] [--retrieve-only] [-k N] [--max-steps N] [--remember] [--sql-dir DIR] "question"
 
 Configure first:  cp .env.example .env  and fill in LLM_BASE_URL / LLM_API_KEY.
 `)
@@ -188,6 +188,7 @@ func runAsk(args []string) error {
 	maxSteps := fs.Int("max-steps", 3, "maximum retrieve/judge rounds")
 	remember := fs.Bool("remember", false, "search memory, and write back a takeaway after answering")
 	maxHops := fs.Int("max-hops", 2, "relational graph traversal depth")
+	sqlDir := fs.String("sql-dir", "", "directory of CSV tables to enable the structured (text-to-SQL) tier")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -227,6 +228,17 @@ func runAsk(args []string) error {
 			return fmt.Errorf("load graph: %w", err)
 		}
 		registry[core.TierRelational] = rel
+	}
+
+	// The structured tier needs a SQLRunner. The CSV runner here is a demo
+	// backend; production implements SQLRunner over database/sql with a role
+	// granted SELECT only.
+	if *sqlDir != "" {
+		runner, err := tiers.LoadCSVDir(*sqlDir)
+		if err != nil {
+			return fmt.Errorf("load sql tables: %w", err)
+		}
+		registry[core.TierStructured] = tiers.NewStructured(client, runner)
 	}
 
 	// Memory is opt-in: it costs an extra LLM call per question and writes to

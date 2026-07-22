@@ -15,6 +15,9 @@ import (
 type Answer struct {
 	Text     string
 	Evidence []core.Result
+	// Trace records how the answer was reached. Set by Loop.Run; nil for a bare
+	// Generate call.
+	Trace *Trace
 }
 
 const generateSystem = `You answer questions strictly from the evidence provided.

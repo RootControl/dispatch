@@ -68,7 +68,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `dispatch — agentic tiered retrieval
 
   dispatch ingest --corpus DIR [--dry-run] [--no-context] [--chunk-tokens N]
-  dispatch ask [--trace] [--retrieve-only] [-k N] "question"
+  dispatch ask [--trace] [--retrieve-only] [-k N] [--max-steps N] "question"
 
 Configure first:  cp .env.example .env  and fill in LLM_BASE_URL / LLM_API_KEY.
 `)
@@ -142,8 +142,9 @@ func runAsk(args []string) error {
 	fs := flag.NewFlagSet("ask", flag.ExitOnError)
 	indexPath := fs.String("index", defaultIndexPath, "index to read")
 	topK := fs.Int("k", 5, "results to retrieve per tier")
-	trace := fs.Bool("trace", false, "show routing and retrieval steps")
-	retrieveOnly := fs.Bool("retrieve-only", false, "print evidence without generating an answer")
+	trace := fs.Bool("trace", false, "show routing, retrieval, and judge steps")
+	retrieveOnly := fs.Bool("retrieve-only", false, "print evidence without running the loop")
+	maxSteps := fs.Int("max-steps", 3, "maximum retrieve/judge rounds")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -172,45 +173,49 @@ func runAsk(args []string) error {
 	slices.Sort(available)
 
 	ctx := context.Background()
-	decision, err := router.Heuristic{Available: available}.Route(ctx, question)
-	if err != nil {
-		return err
-	}
-	if *trace {
-		fmt.Printf("route  [%s] -> %v\n       %s\n", decision.Source, decision.Tiers, decision.Reason)
-	}
 
-	var evidence []core.Result
-	for _, t := range decision.Tiers {
-		r, ok := registry[t]
-		if !ok {
-			continue
-		}
-		got, err := r.Retrieve(ctx, core.Query{Text: question, TopK: *topK})
+	// --retrieve-only skips the loop entirely: route once, retrieve once, print.
+	// Useful for inspecting retrieval quality without paying for judge calls.
+	if *retrieveOnly {
+		decision, err := router.Heuristic{Available: available}.Route(ctx, question)
 		if err != nil {
 			return err
 		}
 		if *trace {
-			fmt.Printf("retrieve [%s] -> %d results\n", t, len(got))
+			fmt.Printf("route [%s] -> %v (%s)\n\n", decision.Source, decision.Tiers, decision.Reason)
 		}
-		evidence = append(evidence, got...)
-	}
-	if len(evidence) == 0 {
-		return fmt.Errorf("no evidence retrieved from %d indexed chunks", store.Len())
-	}
-
-	if *retrieveOnly {
+		var evidence []core.Result
+		for _, t := range decision.Tiers {
+			got, err := registry[t].Retrieve(ctx, core.Query{Text: question, TopK: *topK})
+			if err != nil {
+				return err
+			}
+			evidence = append(evidence, got...)
+		}
+		if len(evidence) == 0 {
+			return fmt.Errorf("no evidence retrieved from %d indexed chunks", store.Len())
+		}
 		fmt.Println(agent.FormatEvidence(evidence))
 		return nil
 	}
 
-	answer, err := agent.Generate(ctx, client, question, evidence)
+	loop := &agent.Loop{
+		LLM:        client,
+		Router:     router.Heuristic{Available: available},
+		Retrievers: registry,
+		MaxSteps:   *maxSteps,
+		TopK:       *topK,
+	}
+	answer, err := loop.Run(ctx, question)
 	if err != nil {
+		if answer.Trace != nil && *trace {
+			fmt.Fprintln(os.Stderr, answer.Trace)
+		}
 		return err
 	}
-	fmt.Println(answer)
+	fmt.Println(answer.Text)
 	if *trace {
-		fmt.Printf("\n--- evidence (%d) ---\n%s\n", len(evidence), agent.FormatEvidence(evidence))
+		fmt.Printf("\n--- trace ---\n%s\n", answer.Trace)
 	}
 	return nil
 }

@@ -40,11 +40,13 @@ go run ./cmd/dispatch ingest --corpus ./testdata/corpus
 go run ./cmd/dispatch ask --trace "What is the Atlas budget?"
 ```
 
-Works against any OpenAI-compatible endpoint. For Ollama you need **two** models —
-a chat model and a separate embedding model, since chat models cannot embed:
+Works against any OpenAI-compatible endpoint. For a local Ollama setup, the
+measured recommendation is three models — see [Models](#models) for why:
 
 ```bash
-ollama pull nomic-embed-text
+ollama pull qwen2.5:7b        # answering: non-thinking, not a reasoning model
+ollama pull llama3.2:3b       # mechanical passes: ~11x faster, better index
+ollama pull nomic-embed-text  # embeddings: a chat model cannot do this
 ```
 
 Always run `ingest --dry-run` first: it reports chunk count and how many LLM
@@ -90,9 +92,23 @@ Pointing `--corpus` at a repository skips `node_modules`, `.git`, `dist`,
 `vendor`, `build` and similar by default; `--exclude` adds more. Without this a
 Node checkout offers 4,602 markdown files where 13 are worth reading.
 
-### Choosing models
+## Models
 
-Measured on this project's own evals, same corpus, same embeddings:
+Three roles, three different requirements. Everything below was measured on this
+project's own evals against the same corpus and embeddings.
+
+| Role | Env var | Recommended | Why |
+|---|---|---|---|
+| Answering | `LLM_CHAT_MODEL` | `qwen2.5:7b` | Non-thinking. Matches a 9.6 GB reasoning model on routing and answers at half the time and memory. |
+| Mechanical | `LLM_UTILITY_MODEL` | `llama3.2:3b` | Context sentences, extraction, summaries, coreference. ~11x faster and produced a *better* index. |
+| Embedding | `LLM_EMBED_MODEL` | `nomic-embed-text` | Required separately — a chat model cannot embed. |
+| Reranking | `--rerank` | **leave off** | Measured worse than no reranking with every chat model tried. |
+
+```bash
+ollama pull qwen2.5:7b && ollama pull llama3.2:3b && ollama pull nomic-embed-text
+```
+
+### Prefer a non-thinking answering model
 
 | Answering model | Answer eval | Routing top-1 | Judge converges | Size |
 |---|---|---|---|---|
@@ -100,29 +116,30 @@ Measured on this project's own evals, same corpus, same embeddings:
 | **`qwen2.5:7b`** | **2m44s** | **12/13** | 5/8 in round 1 | **4.7 GB** |
 | `llama3.2:3b` | 1m32s | 11/13 | 0/8 in round 1 | 2.0 GB |
 
-All three scored 8/8 on answer quality, so that column cannot separate them — the
-routing eval and the judge behaviour can.
+All three scored 8/8 on answer quality, so that column cannot choose between
+them — it is saturated. Routing accuracy and judge behaviour can.
 
-`qwen2.5:7b` is the better default: it matches the thinking model's routing
-accuracy and answer quality at roughly half the wall-clock and half the memory.
-The reasoning model's advantage shows only in the judge, which converges in one
-round rather than three — that costs extra retrieval rounds but did not change
-any answer here.
+A reasoning model spends its output budget thinking before answering: measured,
+~880 characters of reasoning for a one-sentence reply. That is slow, and on long
+prompts it is the cause of empty completions — the model runs out of budget
+mid-thought and returns nothing. Its one real advantage here is a judge that
+converges in a single round rather than three, which costs retrieval rounds but
+changed no answer.
 
-Size matters more than the table suggests. At 4.7 GB the answering model, the
-utility model and the embedding model all stay resident together on a 17 GB
-machine; at 9.6 GB they evict each other and reload, which is invisible in
-per-call benchmarks and expensive in real runs.
+Size matters more than the table suggests. At 4.7 GB the answering, utility and
+embedding models are all resident together on a 17 GB machine; at 9.6 GB they
+evict one another and reload — invisible in a per-call benchmark, expensive in a
+real run.
 
-`llama3.2:3b` is fastest and is a fine *utility* model, but as the answering
-model its judge never says "sufficient" — every question burns the full step
-budget — and its routing drops to 85%.
+`llama3.2:3b` is the fastest and the wrong choice for this role: its judge never
+returns "sufficient", so every question burns the full step budget, and routing
+drops to 85%.
 
-### Two models, not one
+### Use a smaller model for the mechanical passes
 
-`LLM_UTILITY_MODEL` routes the mechanical passes — context sentences, entity
-extraction, summaries, coreference — to a separate, smaller model. They are the
-bulk of ingest and none of them reason; they rewrite or classify text.
+`LLM_UTILITY_MODEL` routes context sentences, entity extraction, summaries and
+coreference to a separate model. These are the bulk of ingest and none of them
+reason — they rewrite or classify text.
 
 On 18 chunks: **20 seconds with `llama3.2:3b` against ~234 seconds with
 `gemma4:e4b`, about 11x** — and the cheaper model produced the *better* index
@@ -130,8 +147,15 @@ On 18 chunks: **20 seconds with `llama3.2:3b` against ~234 seconds with
 artifact, so switching invalidates rather than silently reusing another model's
 work.
 
-If you set only one model, nothing changes: the utility model defaults to the
-chat model.
+Set only `LLM_CHAT_MODEL` and nothing changes: the utility model defaults to it.
+
+### Do not rerank with a chat model
+
+Off by default, and it should stay off — see the limitations section for the
+measurements. Briefly: RRF's own top-5 is already 94% correct, and a chat model
+asked to reorder 20 candidates evicts right answers rather than promoting them.
+A purpose-built cross-encoder is a different thing and `index.Reranker` exists so
+one can be dropped in.
 
 ## The two ideas that matter most
 
@@ -182,16 +206,21 @@ tier and the answer still looks fine, so this is scored on its own:
 go run ./cmd/dispatch eval --router both -v
 ```
 
-On the 13 bundled cases with `gemma4:e4b`:
+On the 13 bundled cases, by router and answering model:
 
-| Router | top-1 | top-2 | cost |
+| Router | Model | top-1 | top-2 |
 |---|---|---|---|
-| heuristic | 12/13 (92%) | 92% | free, instant |
-| llm | 12/13 (92%) | 13/13 (100%) | 13 calls, ~3.5 min |
+| heuristic | — (keywords) | 12/13 (92%) | 12/13 (92%) |
+| llm | `gemma4:e4b` | 12/13 (92%) | 13/13 (100%) |
+| llm | `qwen2.5:7b` | 12/13 (92%) | 12/13 (92%) |
+| llm | `llama3.2:3b` | 11/13 (85%) | 13/13 (100%) |
 
 Top-2 matters because the loop fans out — a correct tier ranked second is still
-searched in the same round, so the LLM router's only miss would still have hit
-the right tier.
+searched in the same round, so a top-2 hit is a near-miss rather than a miss.
+
+The keyword router matches every model on top-1 while costing nothing and taking
+no time, which is why it remains the default. `--llm-router` is worth it only
+when questions use vocabulary the keywords do not cover.
 
 The heuristic was at 85% until a real corpus showed its relational vocabulary
 was entirely org-chart shaped (`reports to`, `manager`, `signed`) with nothing

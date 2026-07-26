@@ -48,6 +48,12 @@ type GraphStats struct {
 	Relations int
 	LLMCalls  int
 	CacheHits int
+	// Skipped counts chunks whose extraction failed. They contribute no
+	// entities, which is a smaller loss than discarding the whole build.
+	Skipped int
+	// FirstError is the first extraction failure, kept so a build that skipped
+	// chunks can explain why rather than only reporting a count.
+	FirstError error
 }
 
 type extraction struct {
@@ -108,7 +114,15 @@ func BuildGraph(ctx context.Context, l llm.LLM, store *index.Store, opts GraphOp
 			llm.User(fmt.Sprintf("<excerpt>\n%s\n</excerpt>", strings.TrimSpace(body))),
 		}
 		if err := l.ChatJSON(ctx, msgs, &ex); err != nil {
-			return nil, stats, fmt.Errorf("tiers: extract from %s: %w", c.ID, err)
+			// One unextractable chunk must not discard the whole build. On a
+			// large corpus extraction runs for tens of minutes, and aborting at
+			// chunk 60 of 70 throws away every earlier call. A skipped chunk
+			// costs its entities; an aborted build costs all of them.
+			stats.Skipped++
+			if stats.FirstError == nil {
+				stats.FirstError = fmt.Errorf("extract from %s: %w", c.ID, err)
+			}
+			continue
 		}
 		stats.LLMCalls++
 		if encoded, err := json.Marshal(ex); err == nil {

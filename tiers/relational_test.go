@@ -3,6 +3,7 @@ package tiers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -368,5 +369,38 @@ func TestExtractionJSONShape(t *testing.T) {
 	}
 	if len(ex.Relations) != 1 || ex.Relations[0].Relation != "owns" {
 		t.Errorf("relations decoded wrong: %+v", ex.Relations)
+	}
+}
+
+// A long extraction run must not be discarded because one chunk failed. On a
+// real corpus this runs for tens of minutes; aborting at chunk 60 of 70 throws
+// away every earlier call.
+func TestBuildGraphSkipsUnextractableChunks(t *testing.T) {
+	var n int
+	f := &fake.LLM{ChatFunc: func(msgs []llm.Message) (string, error) {
+		n++
+		if n == 2 { // the middle chunk fails
+			return "", errors.New("model returned reasoning but no answer")
+		}
+		if strings.Contains(msgs[len(msgs)-1].Content, "Priya") {
+			return `{"entities":[{"name":"Priya Raman","type":"person"}],
+			         "relations":[{"from":"Priya Raman","relation":"reports to","to":"VP of Platform"}]}`, nil
+		}
+		return `{"entities":[],"relations":[]}`, nil
+	}}
+
+	rel, stats, err := BuildGraph(context.Background(), f, relationalStore(t, f), GraphOptions{})
+	if err != nil {
+		t.Fatalf("one bad chunk should not fail the build: %v", err)
+	}
+	if stats.Skipped != 1 {
+		t.Errorf("Skipped = %d, want 1", stats.Skipped)
+	}
+	if stats.FirstError == nil {
+		t.Error("a skipped chunk should be explainable, not just counted")
+	}
+	// The surviving chunks must still have produced a usable graph.
+	if _, relations := rel.Stats(); relations == 0 {
+		t.Error("expected relations from the chunks that did extract")
 	}
 }

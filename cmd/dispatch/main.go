@@ -176,6 +176,12 @@ func runIngest(args []string) error {
 		}
 		fmt.Printf("graph: %d entities, %d relations (%d LLM calls, %d cache hits) -> %s\n",
 			gstats.Entities, gstats.Relations, gstats.LLMCalls, gstats.CacheHits, graphPath)
+		// Silent truncation would read as full coverage, so say what was lost.
+		if gstats.Skipped > 0 {
+			fmt.Printf("  WARNING: %d of %d chunks could not be extracted and contribute no entities\n",
+				gstats.Skipped, gstats.Chunks)
+			fmt.Printf("  first failure: %v\n", gstats.FirstError)
+		}
 	}
 	return nil
 }

@@ -136,6 +136,11 @@ type apiError struct {
 
 func (e *apiError) Error() string { return fmt.Sprintf("%s: %s", e.Type, e.Message) }
 
+// ErrEmptyCompletion reports that the model returned no usable content. It is
+// worth retrying: thinking models are stochastic, and a second attempt often
+// produces a shorter reasoning chain that leaves room for an answer.
+var ErrEmptyCompletion = errors.New("llm: empty completion")
+
 // Chat implements LLM.
 func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 	return c.chat(ctx, messages, false)
@@ -147,6 +152,11 @@ func (c *Client) ChatJSON(ctx context.Context, messages []Message, out any) erro
 	var lastErr error
 	for attempt := 0; attempt <= c.cfg.MaxRetries; attempt++ {
 		raw, err := c.chat(ctx, messages, true)
+		if errors.Is(err, ErrEmptyCompletion) {
+			// Retry: a fresh sample may reason less and leave room to answer.
+			lastErr = err
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -182,11 +192,11 @@ func (c *Client) chat(ctx context.Context, messages []Message, jsonMode bool) (s
 	// and emitting no content, so say that explicitly when it happens.
 	if strings.TrimSpace(choice.Message.Content) == "" {
 		if r := strings.TrimSpace(choice.Message.Reasoning); r != "" {
-			return "", fmt.Errorf("llm: model returned %d characters of reasoning but no answer (finish_reason %q): "+
+			return "", fmt.Errorf("%w: model returned %d characters of reasoning but no answer (finish_reason %q): "+
 				"the output budget was spent thinking — shorten the prompt, lower the evidence count, or use a non-thinking model",
-				len(r), choice.FinishReason)
+				ErrEmptyCompletion, len(r), choice.FinishReason)
 		}
-		return "", fmt.Errorf("llm: model returned an empty completion (finish_reason %q)", choice.FinishReason)
+		return "", fmt.Errorf("%w (finish_reason %q)", ErrEmptyCompletion, choice.FinishReason)
 	}
 	return choice.Message.Content, nil
 }

@@ -228,3 +228,51 @@ func TestMergeDedupesAndCaps(t *testing.T) {
 		t.Errorf("expected [x y] preserving arrival order, got %v", []string{got[0].SourceID, got[1].SourceID})
 	}
 }
+
+// The judge's next_tier is a reordering, not an exclusion. Replacing the tier
+// set outright narrowed the search permanently: on a two-part question the
+// judge named the relational tier, the loop dropped semantic — which held the
+// missing fact — and spent its remaining rounds re-querying the same edges.
+func TestLoopPromotesSuggestedTierWithoutDroppingOthers(t *testing.T) {
+	semantic := &stubRetriever{tier: core.TierSemantic, byQuery: func(q string) []core.Result {
+		return []core.Result{result(core.TierSemantic, "s#"+q, "semantic text")}
+	}}
+	relational := &stubRetriever{tier: core.TierRelational, byQuery: func(q string) []core.Result {
+		return []core.Result{result(core.TierRelational, "r#"+q, "relational text")}
+	}}
+
+	var judged int
+	f := &fake.LLM{ChatFunc: func(msgs []llm.Message) (string, error) {
+		if !isJudge(msgs) {
+			return "answer", nil
+		}
+		judged++
+		if judged == 1 {
+			return `{"sufficient": false, "gap": "who signed", "refined_query": "signer", "next_tier": "relational"}`, nil
+		}
+		return `{"sufficient": true}`, nil
+	}}
+
+	loop := &Loop{
+		LLM:    f,
+		Router: router.Heuristic{Available: []core.Tier{core.TierSemantic, core.TierRelational}},
+		Retrievers: map[core.Tier]core.Retriever{
+			core.TierSemantic: semantic, core.TierRelational: relational,
+		},
+	}
+	if _, err := loop.Run(context.Background(), "who signed the contract?"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both tiers must have been queried again after the suggestion, with the
+	// suggested one leading.
+	if len(semantic.seen()) < 2 {
+		t.Errorf("semantic was dropped after the judge named another tier: %v", semantic.seen())
+	}
+	if len(relational.seen()) < 2 {
+		t.Errorf("relational should have been queried again: %v", relational.seen())
+	}
+	if got := relational.seen()[1]; got != "signer" {
+		t.Errorf("refined query not used: %q", got)
+	}
+}

@@ -107,9 +107,21 @@ func (l *Loop) Run(ctx context.Context, question string) (Answer, error) {
 		if q := strings.TrimSpace(j.RefinedQuery); q != "" {
 			query = q
 		}
+		// Promote the judge's suggested tier to the front, but keep the rest.
+		// Replacing the set outright narrows the search permanently: observed on
+		// a two-part question where the judge named the relational tier, the
+		// loop dropped semantic — which held the missing fact — and then spent
+		// its remaining rounds re-querying the same graph edges and learning
+		// nothing. A suggestion is a reordering, not an exclusion.
 		if t := core.Tier(strings.TrimSpace(j.NextTier)); t != "" {
 			if _, ok := l.Retrievers[t]; ok {
-				tierSet = []core.Tier{t}
+				promoted := []core.Tier{t}
+				for _, existing := range tierSet {
+					if existing != t {
+						promoted = append(promoted, existing)
+					}
+				}
+				tierSet = promoted
 			}
 		}
 	}

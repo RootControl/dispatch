@@ -218,6 +218,10 @@ cached, so the benchmark does not quietly rewrite itself between runs.
 | bundled, 18 chunks | 18/18 | 9/18 (50%) | 17/18 (94%) |
 | real, 70 chunks | 65/70 | 35/65 (54%) | 65/65 (100%) |
 
+The measurement is robust to who writes the questions: regenerating the bundled
+set with `qwen2.5:7b` instead of `llama3.2:3b` moved recall@1 from 50% to 53% and
+left recall@5 at 94%. It is measuring retrieval, not the generator.
+
 Coverage is reported because it can be gamed. A question that refers to its
 source rather than naming its subject — "what configurations are mentioned in
 the passage?" — fits every chunk about configuration, so no retriever can pick
@@ -395,26 +399,33 @@ Measured, not guessed:
   documented `SELECT` subset so the structured tier is demonstrable without a
   driver. Anything outside the subset is a clear error, never a wrong answer.
   Production implements `SQLRunner` over `database/sql`.
-- **Reranking is implemented and measurably harmful with the models to hand.**
-  `index.Reranker` exists, `--rerank` enables it, and the tests pass — but
-  measured on the 18-chunk corpus it took recall@5 from **94% to 39%** and
-  recall@1 from 61% to 33%. It is off by default and should stay off until you
-  have a real reranker.
+- **Reranking with a general chat model makes retrieval worse. Tested twice.**
+  `index.Reranker` exists, `--rerank` enables it, the tests pass — and it is off
+  by default because every measurement says it should be:
 
-  The implementation is not the problem: it parses scores correctly and falls
-  back to retrieval order on failure. The models are. `llama3.2:3b` scores close
-  to noise — asked which vendor supplies the statement mailer, it gave a
-  *staffing* passage the highest score — and because Search over-fetches 20
-  candidates for the reranker to choose 5 from, noisy scores actively evict the
-  right chunk. `gemma4:e4b` judges better but takes ~50s per query, which is not
-  a usable feature.
+  | Reranker | recall@1 | recall@5 | Time |
+  |---|---|---|---|
+  | none | 53% | 94% | 31s |
+  | `llama3.2:3b` | 33% | 39% | 3m39s |
+  | `qwen2.5:7b` | 35% | 88% | 6m47s |
 
-  The literature this came from (Anthropic's 49% → 67%) assumes a purpose-built
-  cross-encoder — Cohere Rerank, `bge-reranker`, Voyage — not a general chat
-  model. `index.Reranker` is a one-method interface precisely so one can be
-  dropped in; until then the honest setting is off. This is the clearest case in
-  the project of a change that is right in principle, correctly built, and still
-  a regression in practice.
+  The first result could be dismissed as a 3B model being too weak. The second
+  cannot: a 2.3x larger model that matches a 9.6 GB reasoning model on routing
+  and answer quality is *still* worse than no reranking, at 13x the wall-clock.
+  Size was not the problem.
+
+  The mechanism is straightforward once stated. RRF's own top-5 is already 94%
+  correct, and Search over-fetches 20 candidates for the reranker to choose 5
+  from. Reranking can only help if the reranker orders better than RRF already
+  does; otherwise the extra 15 candidates are 15 chances to evict a right answer.
+  A chat model asked to score passages 0-10 does not order better than RRF.
+
+  The implementation is not at fault: it parses scores, ignores bogus ids, keeps
+  unscored candidates and falls back to retrieval order on failure. The
+  literature this came from (Anthropic's 49% → 67%) assumes a purpose-built
+  cross-encoder — Cohere Rerank, `bge-reranker`, Voyage — trained for exactly
+  this ordering task. `index.Reranker` is a one-method interface so one can be
+  dropped in. Until then, off.
 - **Concurrency is bounded by the server, and then by memory.** The eval loops
   run `--jobs` items at once (default 4), but Ollama defaults to
   `OLLAMA_NUM_PARALLEL=1` and serves one request at a time, so client

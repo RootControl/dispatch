@@ -111,7 +111,9 @@ that resolve to nothing.
 - **llm** — OpenAI-compatible client over `net/http`, behind an interface so
   everything above it tests offline
 - **index** — contextual chunking + hybrid store (cosine + BM25 fused by RRF)
-- **tiers/** — the four retrievers
+- **tiers/** — the four retrievers, plus the entity graph the relational tier
+  traverses (`graph.go` builds and canonicalizes it, `coref.go` adjudicates
+  which names denote one thing)
 - **router** — LLM classification with a keyword-heuristic fallback
 - **agent** — the loop (`loop.go`), write-back memory (`memory.go`), trace
 - **internal/fake** — scripted LLM + deterministic embedder, so `go test ./...`
@@ -208,26 +210,40 @@ ranking test.
 
 Measured, not guessed:
 
-- **Coreference is adjudicated by the model, and it is imperfect.** Candidates
-  are lexical — a variant must be a unique token-suffix of exactly one other
-  entity, within two tokens of growth — and the merge decision goes to the LLM,
-  three votes with a majority required.
+- **Coreference trades recall for precision, deliberately.** Variants like
+  `Atlas` / `Project Atlas` are merged so both reach one node. Candidates are
+  lexical — a unique token-suffix of exactly one other entity, within two tokens
+  of growth — and the merge decision goes to the model, three votes, majority
+  required.
 
-  A pure-lexical version was tried and rejected: on the real corpus it got about
-  a third of its 23 merges wrong, including `openai` → `azure openai`. That case
-  is the proof no lexical rule suffices — it is identical in shape to
-  `atlas` → `project atlas` and opposite in meaning. On a labeled set the
-  adjudicated version scores 7/9, with every high-stakes pair correct; the
-  errors that remain mostly leave entities split, which loses connections rather
-  than inventing them. Every merge is printed at ingest so it can be audited,
-  and `GraphOptions.NoCoreference` turns it off.
+  Measured across both corpora: **31 candidates → 11 merges, all 11 correct**,
+  and every dangerous pair correctly refused (`openai`/`azure openai`,
+  `model`/`user model`, `api`/`packages api`). The cost is recall: 20 candidates
+  were refused, some of which were probably valid — `external vendor` /
+  `single external vendor` merged on one corpus and was refused on a direct
+  probe. That is the intended direction, though: a refused merge loses a
+  connection, a wrong one invents relationships nothing downstream can detect.
+
+  A pure-lexical version was tried first and rejected: it produced 23 merges on
+  the real corpus and got roughly a third wrong, including `openai` →
+  `azure openai`. That pair is the proof no string rule suffices — identical in
+  shape to `atlas` → `project atlas`, opposite in meaning.
+
+  Merged entities stay reachable under their old names: the variant becomes an
+  alias, because folding `atlas` into `project atlas` would otherwise delete the
+  key a question saying only "Atlas" matches, making retrieval *worse*. Every
+  merge is printed at ingest for audit, and `GraphOptions.NoCoreference` turns
+  the whole pass off.
 
   Still unsolved: forms sharing no head token. `priya` will not reach
   `priya raman`, because a first name is a prefix, and merging on prefix
   re-admits exactly the `api` / `packages/api` failures.
 
-  Rebuilding after any of this is nearly free — extraction is cached on chunk
-  text, so only the adjudication calls are new, and those are cached too.
+  Two things make this fragile on a small model, both found by measurement:
+  a single sample is a coin flip (gemma4 answered both ways on the same pair,
+  which is why it votes), and a one-sided prompt collapses it to always-no
+  (four "false" examples and no "true" ones produced zero merges from nine
+  candidates — indistinguishable from a broken feature).
 - **Thinking models can spend their whole output budget reasoning and return no
   answer.** Found on the real corpus: `gemma4:e4b` given four evidence chunks
   produced 1,114 characters of reasoning, hit `finish_reason: "length"`, and
@@ -256,7 +272,11 @@ Measured, not guessed:
   |---|---|---|---|
   | contextual chunking | ~13s/chunk | ~15 min | yes |
   | graph extraction | ~42s/chunk (p90 65s) | ~40 min | yes |
+  | coreference adjudication | ~46s/candidate (3 votes) | ~18 min | yes |
   | RAPTOR tree | ~30s/summary | ~10 min | **no** |
+
+  Coreference scales with candidate count, not chunk count — 23 candidates for
+  70 chunks — so it grows far more slowly than the rest.
 
   Chunking and extraction are cached by content hash, so re-ingest is free — a
   second run over unchanged documents reported 70 cache hits and 0 calls. The

@@ -177,10 +177,22 @@ percent`) so the score measures correctness rather than phrasing.
 
 Two corpora are scored, and the second is the one that means anything:
 
-| Corpus | Chunks | Tiers | retrieval | facts | citations | end-to-end |
-|---|---|---|---|---|---|---|
-| bundled (`testdata/corpus`) | 18 | 3 | 8/8 | 14/14 | 8/8 | 8/8 |
-| real (15-doc repo checkout) | 70 | 4 | 8/8 | 11/11 | 8/8 | 8/8 |
+| Corpus | Chunks | retrieval | facts | citations | end-to-end |
+|---|---|---|---|---|---|
+| bundled (`testdata/corpus`) | 18 | 8/8 | 14/14 | 8/8 | 8/8 |
+| real (15-doc repo checkout) | 70 | 8/8 | 11/11 | 8/8 | 8/8 |
+
+Both at `-k 4` over semantic + hierarchical + relational. The structured tier is
+absent from these runs because it needs `--sql-dir`; it is exercised separately
+by the design doc's own example, "the total on invoice 4471", which routes
+`[structured semantic]` and answers 162500 from `[structured:line_items]`.
+
+The artifacts behind those rows:
+
+| Corpus | Docs | Chunks | Summary tree | Entities | Relations |
+|---|---|---|---|---|---|
+| bundled | 6 | 18 | 5 summaries, 2 levels | 54 | 69 |
+| real | 15 | 70 | 18 summaries, 3 levels | 468 | 193 |
 
 ```bash
 # the real one, against an index built from your own documents
@@ -289,7 +301,7 @@ Measured, not guessed:
   | coreference adjudication | ~46s/candidate (3 votes) | ~18 min | yes |
   | RAPTOR tree | ~30s/summary | ~10 min | **no** |
 
-  Coreference scales with candidate count, not chunk count — 23 candidates for
+  Coreference scales with candidate count, not chunk count — 22 candidates for
   70 chunks — so it grows far more slowly than the rest.
 
   Chunking and extraction are cached by content hash, so re-ingest is free — a

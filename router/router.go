@@ -41,7 +41,7 @@ var _ Router = Heuristic{}
 // Keyword patterns per tier. Word boundaries matter: without \b, "sign" matches
 // "design" and the relational tier starts eating design questions.
 var patterns = map[core.Tier]*regexp.Regexp{
-	core.TierStructured:   regexp.MustCompile(`\b(total|totals|sum|count|how many|how much|average|avg|invoice|invoices|amount|balance|revenue|price|paid|owed|due|per (month|year|quarter|day))\b`),
+	core.TierStructured: regexp.MustCompile(`\b(total|totals|sum|count|how many|how much|average|avg|invoice|invoices|amount|balance|revenue|price|paid|owed|due|per (month|year|quarter|day))\b`),
 	// Two vocabularies, because relational questions come in two flavours and
 	// the org-chart one alone misses technical corpora entirely: asked "what
 	// does the client workspace depend on?" over a real repository, this matched

@@ -21,6 +21,7 @@ type stackOptions struct {
 	SQLDir    string // empty disables the structured tier
 	MaxHops   int
 	Remember  bool // enables the memory tier
+	Rerank    bool // rescore the retrieved shortlist with the model
 }
 
 // artifactPath names a derived artifact next to its index, so a second corpus
@@ -49,6 +50,9 @@ func buildStack(opts stackOptions) (*stack, error) {
 	store, client, err := newStore(false, 0) // retrieval doesn't contextualize
 	if err != nil {
 		return nil, err
+	}
+	if opts.Rerank {
+		store.SetReranker(&index.LLMReranker{LLM: client})
 	}
 	if err := store.Load(opts.IndexPath); err != nil {
 		return nil, fmt.Errorf("load index (run `dispatch ingest` first): %w", err)

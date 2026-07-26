@@ -36,7 +36,10 @@ type Config struct {
 	Contextualize bool         // run the contextual-chunking LLM pass on ingest
 	CacheTag      string       // model identity folded into cache keys; default "default"
 	EmbedTag      string       // embedding-model identity recorded in saved indexes
-	Parallelism   int          // concurrent context-sentence calls; default 4
+	// Rerank, when set, reorders the fused shortlist before Search returns.
+	// Search over-fetches to give it something to work with.
+	Rerank      Reranker
+	Parallelism int // concurrent context-sentence calls; default 4
 }
 
 // New builds a Store from cfg.
@@ -208,12 +211,30 @@ func (s *Store) Search(ctx context.Context, query string, topK int) ([]Hit, erro
 	vecHits := s.vec.search(qvec[0], pool)
 	bmHits := s.bm.search(query, pool)
 
-	fused := fuseRRF([][]scored{vecHits, bmHits}, 60, topK)
+	// Over-fetch when reranking: a reranker can only reorder what it is given,
+	// so handing it exactly topK would let it improve the order and never the
+	// membership — most of the available gain.
+	fuseTo := topK
+	if s.opts.Rerank != nil {
+		fuseTo = max(topK*4, 20)
+	}
+	fused := fuseRRF([][]scored{vecHits, bmHits}, 60, fuseTo)
 	out := make([]Hit, 0, len(fused))
 	for _, f := range fused {
 		out = append(out, Hit{Chunk: s.chunks[f.id], Score: f.score})
 	}
+	if s.opts.Rerank != nil {
+		return s.opts.Rerank.Rerank(ctx, query, out, topK)
+	}
 	return out, nil
+}
+
+// SetReranker enables reranking on an already-built store, so a loaded index
+// can be searched with or without it.
+func (s *Store) SetReranker(r Reranker) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opts.Rerank = r
 }
 
 // Len reports the number of indexed chunks.

@@ -33,6 +33,12 @@ func (h *Hierarchical) Tier() core.Tier { return core.TierHierarchical }
 type HierarchyOptions struct {
 	Branching int // target leaves per cluster; default 5
 	MaxLevels int // safety bound on tree height; default 4
+	// Cache stores summaries by the content of their members. Without it the
+	// tree is the only stage that pays again on every rebuild, while chunking
+	// and extraction replay for free — a surprise precisely because the other
+	// stages trained you to expect a rebuild to be cheap.
+	Cache    *index.Cache
+	CacheTag string
 }
 
 func (o HierarchyOptions) withDefaults() HierarchyOptions {
@@ -50,6 +56,7 @@ type BuildStats struct {
 	Levels    int
 	Summaries int
 	LLMCalls  int
+	CacheHits int
 }
 
 // BuildHierarchy constructs the summary tree from a store's existing chunks,
@@ -92,11 +99,20 @@ func BuildHierarchy(ctx context.Context, l llm.LLM, leaves *index.Store, opts Hi
 			for _, i := range cluster {
 				members = append(members, texts[i])
 			}
+			// Key on the members themselves, so a cluster that survives a
+			// rebuild unchanged costs nothing even if its level number moved.
+			key := index.Key("summary|"+opts.CacheTag, strconv.Itoa(len(members)), strings.Join(members, "\x00"))
+			if cached, ok := opts.Cache.Get(key); ok && strings.TrimSpace(cached) != "" {
+				stats.CacheHits++
+				summaries = append(summaries, cached)
+				continue
+			}
 			s, err := summarize(ctx, l, members)
-			stats.LLMCalls++
 			if err != nil {
 				return nil, stats, fmt.Errorf("tiers: summarize level %d: %w", level, err)
 			}
+			stats.LLMCalls++
+			_ = opts.Cache.Put(key, s)
 			summaries = append(summaries, s)
 		}
 

@@ -720,3 +720,20 @@ func TestSeedsPartialMatchingIsPeopleOnly(t *testing.T) {
 		t.Errorf("a non-person prefix should not seed: %v", got)
 	}
 }
+
+// Candidate generation must not be all-pairs: a graph large enough to matter
+// would otherwise spend quadratic time before any LLM call is made.
+//
+// This is the worst case for the bucketing — every entity shares a final token,
+// so one bucket holds half of them. Real corpora spread across many buckets.
+func BenchmarkCanonicalizeCandidates(b *testing.B) {
+	g := newGraph()
+	for i := range 5000 {
+		g.addEntity(fmt.Sprintf("entity %d alpha", i), "system")
+		g.addEntity(fmt.Sprintf("thing %d beta", i), "other")
+	}
+	b.ResetTimer()
+	for b.Loop() {
+		g.canonicalize(func(string, string) bool { return false })
+	}
+}

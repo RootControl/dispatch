@@ -73,10 +73,11 @@ func usage() {
                   [--chunk-tokens N] [--exclude DIRS] [--hierarchy] [--graph]
 
   dispatch ask [--index PATH] [--trace] [-k N] [--max-steps N] [--llm-router]
-               [--remember] [--sql-dir DIR] [--max-hops N] [--retrieve-only] "question"
+               [--remember] [--sql-dir DIR] [--max-hops N] [--rerank] [--retrieve-only] "question"
 
   dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]   # routing accuracy
   dispatch eval answers [--index PATH] [--cases FILE] [-k N] [-v]   # answer quality
+  dispatch eval retrieval [--index PATH] [-k N] [--rerank] [-v]     # recall over every chunk
 
 Artifacts live beside their index: --index .dispatch/x.json puts the summary tree
 at .dispatch/x-hierarchy.json and the entity graph at .dispatch/x-graph.json, so
@@ -86,6 +87,26 @@ Configure first:  cp .env.example .env  and fill in LLM_BASE_URL / LLM_API_KEY.
 `)
 }
 
+// utilityLLM returns the model for mechanical passes — context sentences,
+// entity extraction, summaries, coreference — and reports whether it differs
+// from the answering model.
+//
+// Those passes are the bulk of ingest (~13s and ~42s per chunk on an 8B
+// thinking model) and none of them need reasoning: they rewrite or classify
+// text. Pointing LLM_UTILITY_MODEL at something small is the largest single
+// lever on ingest cost. Unset, it is the chat model and nothing changes.
+func utilityLLM(client *llm.Client) (*llm.Client, string, bool) {
+	name := os.Getenv("LLM_UTILITY_MODEL")
+	if name == "" || name == client.ChatModel() {
+		return client, client.ChatModel(), false
+	}
+	u, err := llm.New(llm.Config{ChatModel: name})
+	if err != nil {
+		return client, client.ChatModel(), false
+	}
+	return u, name, true
+}
+
 // newStore wires an index.Store to the configured endpoint. Cache and index are
 // tagged with the model names so swapping models invalidates derived data.
 func newStore(contextualize bool, chunkTokens int) (*index.Store, *llm.Client, error) {
@@ -93,13 +114,18 @@ func newStore(contextualize bool, chunkTokens int) (*index.Store, *llm.Client, e
 	if err != nil {
 		return nil, nil, err
 	}
+	util, utilName, _ := utilityLLM(client)
 	s := index.New(index.Config{
 		LLM:           client,
+		ContextLLM:    util,
 		Cache:         index.NewCache(defaultCacheDir),
 		Contextualize: contextualize,
-		CacheTag:      client.ChatModel(),
-		EmbedTag:      client.EmbedModel(),
-		Chunk:         index.ChunkOptions{TargetTokens: chunkTokens},
+		// Cache and index are tagged with the model that PRODUCED them: context
+		// sentences come from the utility model, so switching it must invalidate
+		// them rather than silently reuse another model's work.
+		CacheTag: utilName,
+		EmbedTag: client.EmbedModel(),
+		Chunk:    index.ChunkOptions{TargetTokens: chunkTokens},
 	})
 	return s, client, nil
 }
@@ -137,7 +163,11 @@ func runIngest(args []string) error {
 		fmt.Printf("dry run: %d docs -> %d chunks\n", plan.Docs, plan.Chunks)
 		fmt.Printf("  context calls to make: %d (%d already cached)\n", plan.LLMCalls, plan.CacheHits)
 		fmt.Printf("  embedding calls:       %d batch(es), %d texts\n", plan.Docs, plan.Chunks)
+		_, utilName, split := utilityLLM(client)
 		fmt.Printf("  chat model %s, embed model %s\n", client.ChatModel(), client.EmbedModel())
+		if split {
+			fmt.Printf("  utility model %s (context sentences, extraction, summaries)\n", utilName)
+		}
 		return nil
 	}
 
@@ -155,8 +185,13 @@ func runIngest(args []string) error {
 	// The tree is opt-in: it costs roughly one LLM call per cluster per level on
 	// top of ingestion, and is only useful for corpus-wide questions.
 	if *hierarchy {
-		h, hstats, err := tiers.BuildHierarchy(context.Background(), client, store,
-			tiers.HierarchyOptions{Branching: *branching})
+		util, utilName, _ := utilityLLM(client)
+		h, hstats, err := tiers.BuildHierarchy(context.Background(), util, store,
+			tiers.HierarchyOptions{
+				Branching: *branching,
+				Cache:     index.NewCache(defaultCacheDir),
+				CacheTag:  utilName,
+			})
 		if err != nil {
 			return err
 		}
@@ -164,16 +199,17 @@ func runIngest(args []string) error {
 		if err := h.Save(hierarchyPath); err != nil {
 			return err
 		}
-		fmt.Printf("hierarchy: %d levels, %d summaries (%d LLM calls) -> %s\n",
-			hstats.Levels, hstats.Summaries, hstats.LLMCalls, hierarchyPath)
+		fmt.Printf("hierarchy: %d levels, %d summaries (%d LLM calls, %d cache hits) -> %s\n",
+			hstats.Levels, hstats.Summaries, hstats.LLMCalls, hstats.CacheHits, hierarchyPath)
 	}
 
 	// Also opt-in: extraction is one LLM call per chunk, cached by content hash
 	// so a rebuild over unchanged documents is free.
 	if *graph {
-		rel, gstats, err := tiers.BuildGraph(context.Background(), client, store, tiers.GraphOptions{
+		util, utilName, _ := utilityLLM(client)
+		rel, gstats, err := tiers.BuildGraph(context.Background(), util, store, tiers.GraphOptions{
 			Cache:    index.NewCache(defaultCacheDir),
-			CacheTag: client.ChatModel(),
+			CacheTag: utilName,
 		})
 		if err != nil {
 			return err
@@ -225,6 +261,7 @@ func runAsk(args []string) error {
 	maxHops := fs.Int("max-hops", 2, "relational graph traversal depth")
 	sqlDir := fs.String("sql-dir", "", "directory of CSV tables to enable the structured (text-to-SQL) tier")
 	llmRoute := fs.Bool("llm-router", false, "classify with the model instead of keywords (falls back to keywords on failure)")
+	rerank := fs.Bool("rerank", false, "rescore the retrieved shortlist with the model before answering")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -238,6 +275,7 @@ func runAsk(args []string) error {
 		SQLDir:    *sqlDir,
 		MaxHops:   *maxHops,
 		Remember:  *remember,
+		Rerank:    *rerank,
 	})
 	if err != nil {
 		return err

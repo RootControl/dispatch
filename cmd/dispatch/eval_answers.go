@@ -115,6 +115,7 @@ func evalAnswers(args []string) error {
 	sqlDir := fs.String("sql-dir", "", "CSV tables enabling the structured tier")
 	maxHops := fs.Int("max-hops", 2, "relational traversal depth")
 	llmRoute := fs.Bool("llm-router", false, "classify with the model instead of keywords")
+	rerank := fs.Bool("rerank", false, "rescore the retrieved shortlist with the model")
 	verbose := fs.Bool("v", false, "show the answer text for every case")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -132,7 +133,9 @@ func evalAnswers(args []string) error {
 		return fmt.Errorf("no cases in %s", *casesPath)
 	}
 
-	st, err := buildStack(stackOptions{IndexPath: *indexPath, SQLDir: *sqlDir, MaxHops: *maxHops})
+	st, err := buildStack(stackOptions{
+		IndexPath: *indexPath, SQLDir: *sqlDir, MaxHops: *maxHops, Rerank: *rerank,
+	})
 	if err != nil {
 		return err
 	}

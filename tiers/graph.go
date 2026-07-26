@@ -157,13 +157,27 @@ const maxMergeGrowth = 2
 // since a first name is a prefix, and merging on prefix re-admits the failures
 // above.
 func (g *Graph) canonicalize(confirm func(short, long string) bool) []Merge {
+	// Bucket by final token first. Only an entity ending in the same word can
+	// have another as a token-suffix, which turns an all-pairs scan into a scan
+	// within small buckets — the difference between 468 entities costing 219k
+	// comparisons and costing a few hundred, and the difference between
+	// tractable and not at ten thousand.
+	byLastToken := map[string][]string{}
+	for key := range g.Entities {
+		if f := strings.Fields(key); len(f) > 0 {
+			last := f[len(f)-1]
+			byLastToken[last] = append(byLastToken[last], key)
+		}
+	}
+
 	candidates := map[string][]string{} // variant -> entities it is a suffix of
 	for short := range g.Entities {
 		if short == "" {
 			continue
 		}
-		shortTokens := len(strings.Fields(short))
-		for long := range g.Entities {
+		fields := strings.Fields(short)
+		shortTokens := len(fields)
+		for _, long := range byLastToken[fields[len(fields)-1]] {
 			if long == short || !strings.HasSuffix(long, " "+short) {
 				continue
 			}

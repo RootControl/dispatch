@@ -387,6 +387,18 @@ Measured, not guessed:
   dropped in; until then the honest setting is off. This is the clearest case in
   the project of a change that is right in principle, correctly built, and still
   a regression in practice.
+- **Concurrency in the evals is bounded by the server, not the client.** The
+  eval loops run `--jobs` items at once (default 4) and the LLM client has its
+  own semaphore, but Ollama serves one request at a time for a large model:
+  measured, four concurrent `gemma4:e4b` calls took 3.3s against 0.6s for one —
+  no speedup at all — while `llama3.2:3b` parallelised cleanly. Parallelising
+  the answer eval therefore moved it 5m27s to 4m58s, about 9%, not the ~4x the
+  arithmetic suggested. The gain that did appear came from the utility-model
+  calls.
+
+  If eval latency matters, the levers are `OLLAMA_NUM_PARALLEL` (a server
+  setting, and it needs the memory to hold several context slots), a smaller
+  answering model, or a hosted endpoint — not more client concurrency.
 - **Both eval corpora are still small** — 18 and 70 chunks. 70 is enough to make
   ranking matter; it is not enough to say anything about behaviour at 10,000,
   where a flat cosine scan and an in-memory graph both stop being reasonable.

@@ -92,6 +92,7 @@ type answerScore struct {
 	tiers        []core.Tier
 	rounds       int
 	err          error
+	answer       string // kept for -v, printed in order rather than as it arrives
 }
 
 func (s answerScore) pass() bool {
@@ -117,6 +118,7 @@ func evalAnswers(args []string) error {
 	llmRoute := fs.Bool("llm-router", false, "classify with the model instead of keywords")
 	rerank := fs.Bool("rerank", false, "rescore the retrieved shortlist with the model")
 	verbose := fs.Bool("v", false, "show the answer text for every case")
+	jobs := fs.Int("jobs", defaultJobs, "cases to evaluate concurrently")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -151,9 +153,14 @@ func evalAnswers(args []string) error {
 		len(cases), st.store.Len(), st.available)
 
 	ctx := context.Background()
+	// Score concurrently, report in case order. Serially this was one round trip
+	// per judge and per generate — about 25s each on a local thinking model.
+	scores := mapIndexed(len(cases), *jobs, "scoring", func(i int) answerScore {
+		return scoreAnswer(ctx, loop, cases[i], *verbose)
+	})
+
 	var retrievedN, factsN, factsTotalN, citeOK, passN int
-	for i, c := range cases {
-		s := scoreAnswer(ctx, loop, c, *verbose)
+	for i, s := range scores {
 		if s.retrieved {
 			retrievedN++
 		}
@@ -165,7 +172,7 @@ func evalAnswers(args []string) error {
 		if s.pass() {
 			passN++
 		}
-		printAnswerCase(i+1, c, s)
+		printAnswerCase(i+1, cases[i], s)
 	}
 
 	fmt.Printf("\nretrieval:  %d/%d  (expected document reached the evidence)\n", retrievedN, len(cases))
@@ -221,12 +228,15 @@ func scoreAnswer(ctx context.Context, loop *agent.Loop, c answerCase, verbose bo
 	}
 
 	if verbose {
-		fmt.Printf("--- %s\n%s\n\n", c.Question, strings.TrimSpace(ans.Text))
+		s.answer = strings.TrimSpace(ans.Text)
 	}
 	return s
 }
 
 func printAnswerCase(n int, c answerCase, s answerScore) {
+	if s.answer != "" {
+		fmt.Printf("--- %s\n%s\n\n", c.Question, s.answer)
+	}
 	status := "PASS"
 	switch {
 	case s.err != nil:

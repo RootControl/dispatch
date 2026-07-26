@@ -4,6 +4,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 )
 
@@ -35,6 +36,10 @@ type Graph struct {
 	Aliases map[string]string `json:"aliases,omitempty"`
 
 	adj map[string][]int // normalized entity -> edge indices, both directions
+	// mu guards the lazy reindex in Traverse. Retrieval is read-only once a
+	// graph is built, and evaluation drives several queries at once, so the one
+	// path that can mutate needs a lock.
+	mu sync.Mutex
 }
 
 func newGraph() *Graph {
@@ -364,9 +369,11 @@ type EdgeHit struct {
 // distance from any seed — which is what makes hop count usable as a relevance
 // signal.
 func (g *Graph) Traverse(seeds []string, maxHops int) []EdgeHit {
+	g.mu.Lock()
 	if len(g.adj) == 0 {
 		g.reindex()
 	}
+	g.mu.Unlock()
 	type queued struct {
 		node string
 		hop  int

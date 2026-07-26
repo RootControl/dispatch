@@ -45,6 +45,7 @@ func evalRetrieval(args []string) error {
 	rerank := fs.Bool("rerank", false, "rescore the shortlist before measuring")
 	verbose := fs.Bool("v", false, "show every probe, not just misses")
 	questionsPath := fs.String("questions", "", "write the generated questions here, as answer-eval cases")
+	jobs := fs.Int("jobs", defaultJobs, "chunks to probe concurrently")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -71,51 +72,70 @@ func evalRetrieval(args []string) error {
 	fmt.Printf("=== retrieval recall: %d chunks, k=%d, rerank=%v ===\n\n", len(chunks), *topK, *rerank)
 
 	ctx := context.Background()
-	var probed, hitAt1, hitAtK, generated, cached, skipped int
-	var misses []string
-	var cases []answerCase
 
-	for _, c := range chunks {
+	// One probe per chunk, concurrently, reported in chunk order.
+	type probe struct {
+		question string
+		rank     int // -1 = not retrieved
+		fresh    bool
+		skipped  bool
+		err      error
+	}
+	probes := mapIndexed(len(chunks), *jobs, "probing", func(i int) probe {
+		c := chunks[i]
 		q, fresh, err := needleQuestion(ctx, util, cache, utilName, c)
 		if err != nil || strings.TrimSpace(q) == "" {
 			// No well-formed question for this chunk, so it goes unmeasured.
 			// Counted and reported: dropping chunks quietly and printing a
 			// recall over what remains is how a benchmark flatters itself.
+			return probe{skipped: true, err: err}
+		}
+		got, err := semantic.Retrieve(ctx, core.Query{Text: q, TopK: *topK})
+		if err != nil {
+			return probe{question: q, fresh: fresh, err: err}
+		}
+		p := probe{question: q, rank: -1, fresh: fresh}
+		for j, r := range got {
+			if r.SourceID == c.ID {
+				p.rank = j
+				break
+			}
+		}
+		return p
+	})
+
+	var probed, hitAt1, hitAtK, generated, cached, skipped int
+	var misses []string
+	var cases []answerCase
+	for i, p := range probes {
+		c := chunks[i]
+		if p.skipped {
 			skipped++
 			continue
 		}
-		if fresh {
+		if p.err != nil {
+			return p.err
+		}
+		if p.fresh {
 			generated++
 		} else {
 			cached++
 		}
-
-		got, err := semantic.Retrieve(ctx, core.Query{Text: q, TopK: *topK})
-		if err != nil {
-			return err
-		}
 		probed++
-		rank := -1
-		for i, r := range got {
-			if r.SourceID == c.ID {
-				rank = i
-				break
-			}
-		}
 		switch {
-		case rank == 0:
+		case p.rank == 0:
 			hitAt1++
 			hitAtK++
-		case rank > 0:
+		case p.rank > 0:
 			hitAtK++
 		default:
-			misses = append(misses, fmt.Sprintf("%s — %s", c.ID, truncate(q, 68)))
+			misses = append(misses, fmt.Sprintf("%s — %s", c.ID, truncate(p.question, 68)))
 		}
 		if *verbose {
-			fmt.Printf("  rank %2d  %-28s %s\n", rank, c.ID, truncate(q, 56))
+			fmt.Printf("  rank %2d  %-28s %s\n", p.rank, c.ID, truncate(p.question, 56))
 		}
 		cases = append(cases, answerCase{
-			Question:      q,
+			Question:      p.question,
 			ExpectSources: []string{c.DocID},
 			Note:          "generated from " + c.ID,
 		})

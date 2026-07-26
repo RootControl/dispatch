@@ -187,6 +187,13 @@ Two corpora are scored, and the second is the one that means anything:
 go run ./cmd/dispatch eval answers --index .dispatch/mine.json --cases mine.json -k 4
 ```
 
+Both rows were re-measured after coreference merging landed, and neither moved.
+That is the result worth having from a change like that: entity merging is a
+destructive rewrite of the graph, so the useful evidence is that it changed
+nothing downstream. A question naming a merged-away variant still resolves —
+asked about the "statement mailer", which is now an alias of "customer statement
+mailer", the relational tier returns that node's edges.
+
 The bundled score is close to meaningless on its own: those cases were written
 against a corpus written for them, and at `-k 4` across three tiers up to 12 of
 18 chunks reach the evidence, so retrieval barely has to *rank*. The real corpus

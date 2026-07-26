@@ -52,7 +52,12 @@ func buildStack(opts stackOptions) (*stack, error) {
 		return nil, err
 	}
 	if opts.Rerank {
-		store.SetReranker(&index.LLMReranker{LLM: client})
+		// Reranking on the utility model, not the answering one. Scoring a
+		// shortlist for relevance is a mechanical judgment, and doing it with an
+		// 8B thinking model took ~50s per query against ~2s — slow enough that
+		// the feature would not be used.
+		util, _, _ := utilityLLM(client)
+		store.SetReranker(&index.LLMReranker{LLM: util})
 	}
 	if err := store.Load(opts.IndexPath); err != nil {
 		return nil, fmt.Errorf("load index (run `dispatch ingest` first): %w", err)

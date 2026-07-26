@@ -76,6 +76,7 @@ dispatch ask [--index PATH] [--trace] [-k N] [--max-steps N] [--llm-router]
 
 dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]   # routing accuracy
 dispatch eval answers [--index PATH] [--cases FILE] [-k N] [-v]   # answer quality
+dispatch eval retrieval [--index PATH] [-k N] [--rerank] [-v]     # recall over every chunk
 ```
 
 The hierarchical and relational tiers are opt-in at ingest time because each
@@ -88,6 +89,21 @@ can coexist without overwriting each other.
 Pointing `--corpus` at a repository skips `node_modules`, `.git`, `dist`,
 `vendor`, `build` and similar by default; `--exclude` adds more. Without this a
 Node checkout offers 4,602 markdown files where 13 are worth reading.
+
+### Two models, not one
+
+`LLM_UTILITY_MODEL` routes the mechanical passes — context sentences, entity
+extraction, summaries, coreference — to a separate, smaller model. They are the
+bulk of ingest and none of them reason; they rewrite or classify text.
+
+On 18 chunks: **20 seconds with `llama3.2:3b` against ~234 seconds with
+`gemma4:e4b`, about 11x** — and the cheaper model produced the *better* index
+(recall@1 61% vs 50%). Cache and index tags follow the model that produced each
+artifact, so switching invalidates rather than silently reusing another model's
+work.
+
+If you set only one model, nothing changes: the utility model defaults to the
+chat model.
 
 ## The two ideas that matter most
 
@@ -155,6 +171,31 @@ for how technical documents state relationships. Adding `depends on`, `requires`
 `part of` and friends moved it to parity on top-1. Its one remaining miss —
 "what is the approved budget figure?" — carries no arithmetic keyword, which is
 the irreducible limit of keyword routing.
+
+**Retrieval recall** — the broadest signal, and the one hand-written cases
+cannot give:
+
+```bash
+go run ./cmd/dispatch eval retrieval -k 5
+```
+
+It generates one question per chunk *from that chunk alone* and asks whether the
+chunk comes back. The generator sees no other chunk, no index and no tier, so it
+cannot flatter the system the way an author who has read the whole corpus can,
+and every chunk gets probed rather than the eight someone chose. Questions are
+cached, so the benchmark does not quietly rewrite itself between runs.
+
+On the 18-chunk corpus, by which model wrote the context sentences:
+
+| Context sentences by | recall@1 | recall@5 |
+|---|---|---|
+| `gemma4:e4b` (8B) | 9/18 (50%) | 17/18 (94%) |
+| `llama3.2:3b` | 11/18 (61%) | 17/18 (94%) |
+
+**This is the number the answer eval was hiding.** Both corpora score 8/8 there,
+but the top-ranked chunk is wrong roughly four times in ten — `-k 4` simply
+supplies enough evidence to answer anyway. Recall@5 at 94% is what makes the
+answer scores possible; recall@1 is what they conceal.
 
 **Answer quality** — end to end, reporting three numbers that need different
 fixes:
@@ -316,6 +357,26 @@ Measured, not guessed:
   documented `SELECT` subset so the structured tier is demonstrable without a
   driver. Anything outside the subset is a clear error, never a wrong answer.
   Production implements `SQLRunner` over `database/sql`.
+- **Reranking is implemented and measurably harmful with the models to hand.**
+  `index.Reranker` exists, `--rerank` enables it, and the tests pass — but
+  measured on the 18-chunk corpus it took recall@5 from **94% to 39%** and
+  recall@1 from 61% to 33%. It is off by default and should stay off until you
+  have a real reranker.
+
+  The implementation is not the problem: it parses scores correctly and falls
+  back to retrieval order on failure. The models are. `llama3.2:3b` scores close
+  to noise — asked which vendor supplies the statement mailer, it gave a
+  *staffing* passage the highest score — and because Search over-fetches 20
+  candidates for the reranker to choose 5 from, noisy scores actively evict the
+  right chunk. `gemma4:e4b` judges better but takes ~50s per query, which is not
+  a usable feature.
+
+  The literature this came from (Anthropic's 49% → 67%) assumes a purpose-built
+  cross-encoder — Cohere Rerank, `bge-reranker`, Voyage — not a general chat
+  model. `index.Reranker` is a one-method interface precisely so one can be
+  dropped in; until then the honest setting is off. This is the clearest case in
+  the project of a change that is right in principle, correctly built, and still
+  a regression in practice.
 - **Both eval corpora are still small** — 18 and 70 chunks. 70 is enough to make
   ranking matter; it is not enough to say anything about behaviour at 10,000,
   where a flat cosine scan and an in-memory graph both stop being reasonable.

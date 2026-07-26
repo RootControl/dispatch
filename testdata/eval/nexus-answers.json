@@ -1,0 +1,38 @@
+[
+  {
+    "question": "Which port does Redis use when running with TLS encryption?",
+    "must_include": ["6380"],
+    "expect_sources": ["redis-config/README.md"],
+    "note": "an exact value buried in a bulleted list"
+  },
+  {
+    "question": "How many nodes does the Redis cluster setup use?",
+    "must_include": [["3 ", "three"]],
+    "expect_sources": ["redis-config/README.md"],
+    "note": "a count stated in a heading"
+  },
+  {
+    "question": "Where should new backend code live, and in what language?",
+    "must_include": [["packages/api", "packages/api"], ["TypeScript", "TS"]],
+    "expect_sources": ["CLAUDE.md"],
+    "note": "two facts from one row of a markdown table"
+  },
+  {
+    "question": "Which workspace is legacy and should have changes minimized?",
+    "must_include": [["/api", "api workspace"], ["minimize", "legacy"]],
+    "expect_sources": ["CLAUDE.md"],
+    "note": "table row; distinguishing /api from packages/api is the hard part"
+  },
+  {
+    "question": "What is the current status of the FerretDB multi-tenancy work?",
+    "must_include": [["active investigation", "investigation"]],
+    "expect_sources": ["packages/data-schemas/misc/ferretdb/ferretdb-multitenancy-plan.md"],
+    "note": "a status line in a deeply nested document"
+  },
+  {
+    "question": "What is this project and what is it for?",
+    "must_include": [["LibreChat", "librechat"]],
+    "expect_sources": ["README.md", "CLAUDE.md"],
+    "note": "open-ended; should be easy, a canary for basic retrieval"
+  }
+]

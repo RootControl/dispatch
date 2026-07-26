@@ -58,3 +58,16 @@ func TestGenerateRefusesWithoutEvidence(t *testing.T) {
 		t.Fatal("expected an error when generating with no evidence")
 	}
 }
+
+// A blank completion must not become a blank answer. Observed live: a thinking
+// model spent its whole output budget on reasoning and returned empty content,
+// which previously surfaced as an answer containing nothing.
+func TestGenerateRejectsEmptyCompletion(t *testing.T) {
+	for name, reply := range map[string]string{"empty": "", "whitespace": "  \n\t "} {
+		f := &fake.LLM{ChatFunc: func([]llm.Message) (string, error) { return reply, nil }}
+		got, err := Generate(context.Background(), f, "What is the budget?", evidence)
+		if err == nil {
+			t.Errorf("%s: expected an error, got answer %q", name, got)
+		}
+	}
+}

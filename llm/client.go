@@ -104,7 +104,14 @@ type responseFormat struct {
 
 type chatResp struct {
 	Choices []struct {
-		Message Message `json:"message"`
+		Message struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+			// Reasoning is non-standard but returned by thinking models via
+			// Ollama. It is read only to diagnose an empty Content.
+			Reasoning string `json:"reasoning"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Error *apiError `json:"error"`
 }
@@ -167,7 +174,21 @@ func (c *Client) chat(ctx context.Context, messages []Message, jsonMode bool) (s
 	if len(resp.Choices) == 0 {
 		return "", errors.New("llm: empty choices in chat response")
 	}
-	return resp.Choices[0].Message.Content, nil
+	choice := resp.Choices[0]
+
+	// An empty completion is never usable, and returning it silently produces a
+	// blank answer that looks like a content problem rather than a model one.
+	// Thinking models hit this by spending the whole output budget on reasoning
+	// and emitting no content, so say that explicitly when it happens.
+	if strings.TrimSpace(choice.Message.Content) == "" {
+		if r := strings.TrimSpace(choice.Message.Reasoning); r != "" {
+			return "", fmt.Errorf("llm: model returned %d characters of reasoning but no answer (finish_reason %q): "+
+				"the output budget was spent thinking — shorten the prompt, lower the evidence count, or use a non-thinking model",
+				len(r), choice.FinishReason)
+		}
+		return "", fmt.Errorf("llm: model returned an empty completion (finish_reason %q)", choice.FinishReason)
+	}
+	return choice.Message.Content, nil
 }
 
 // Embed implements LLM. Vectors are unit-normalized so downstream cosine

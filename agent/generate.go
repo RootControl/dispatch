@@ -48,7 +48,17 @@ func generate(ctx context.Context, l llm.LLM, question, memoryBlock string, evid
 	}
 	fmt.Fprintf(&prompt, "<evidence>\n%s\n</evidence>\n\nQuestion: %s", FormatEvidence(evidence), question)
 
-	return l.Chat(ctx, []llm.Message{llm.System(generateSystem), llm.User(prompt.String())})
+	text, err := l.Chat(ctx, []llm.Message{llm.System(generateSystem), llm.User(prompt.String())})
+	if err != nil {
+		return "", err
+	}
+	// A blank answer is a failure, not an answer. Returning it would surface as
+	// a content problem — "the corpus didn't say" — when the real cause is the
+	// model producing nothing.
+	if strings.TrimSpace(text) == "" {
+		return "", fmt.Errorf("agent: model returned an empty answer for %q", question)
+	}
+	return text, nil
 }
 
 // FormatEvidence renders results as a citation-labeled block. The [tier:source]

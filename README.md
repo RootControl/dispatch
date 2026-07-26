@@ -135,6 +135,17 @@ percent`) so the score measures correctness rather than phrasing.
 On the 8 bundled cases over 18 chunks with `gemma4:e4b`, all three metrics come
 out 8/8. **Read that with suspicion rather than satisfaction** — see below.
 
+Run against a real corpus (15 documents from a LibreChat checkout, 70 chunks,
+`testdata/eval/nexus-answers.json`) the numbers are more informative:
+
+```
+retrieval:  6/6    facts: 7/8    citations: 6/6    end-to-end: 5/6
+```
+
+The single failure is the *easiest* question — "what is this project and what is
+it for?" — and it is worth more than the five passes. See **Thinking models**
+below.
+
 ## Known limitations
 
 Measured, not guessed:
@@ -144,11 +155,24 @@ Measured, not guessed:
   and `project` as three separate nodes. Multi-hop traversal can miss paths a
   human would consider connected. Fixing it needs embedding-based coreference or
   an alias table.
+- **Thinking models can spend their whole output budget reasoning and return no
+  answer.** Found on the real corpus: `gemma4:e4b` given four evidence chunks
+  produced 1,114 characters of reasoning, hit `finish_reason: "length"`, and
+  emitted empty content. dispatch used to pass that through as a blank answer,
+  which reads like "the corpus doesn't say" when the real cause is the model.
+  It is now a hard error naming the cause and the fix, and the fix is verified:
+  the same question answers correctly at `-k 2`. If you see it, lower `-k`,
+  shorten chunks, or use a non-thinking model.
+- **Vague queries retrieve noise.** "What is this project and what is it for?"
+  has no distinctive content words, so both BM25 and the embedding latch onto
+  incidental matches — the top hit was a translations how-to that merely says
+  "in the project". Contextual chunking helps but does not rescue a query with
+  nothing to match on.
 - **Ingest is slow on a local thinking model.** Contextual chunking ~13s/chunk
   and graph extraction ~42s/chunk on an 8B model. Both are cached by content
-  hash, so re-ingest is free, but a first run over a large corpus is long.
-  `index.Config.ContextLLM` accepts a separate cheaper model; the CLI does not
-  expose it yet.
+  hash, so re-ingest is free, but a first run over a large corpus is long
+  (70 chunks took ~15 minutes). `index.Config.ContextLLM` accepts a separate
+  cheaper model; the CLI does not expose it yet.
 - **RAPTOR summaries are not cached.** Unlike chunking and extraction, a rebuild
   with `--hierarchy` pays again.
 - **`isReadOnly` is defense in depth, not the primary guard.** Grant the

@@ -58,8 +58,29 @@ type answerCase struct {
 	Note          string   `json:"note,omitempty"`
 }
 
-// citeRE matches the [tier:source] markers the generator is told to emit.
-var citeRE = regexp.MustCompile(`\[([a-z]+):([^\]\s]+)\]`)
+// bracketRE finds any bracketed span; pairRE finds tier:source pairs inside one.
+//
+// Two patterns rather than one because models group citations: asked for
+// [tier:source] markers, gemma4 emitted
+// "[semantic:a.md#0, semantic:a.md#1, semantic:a.md#6]" — three citations in a
+// single bracket. A single-marker regex finds none of them and the citation
+// check then passes vacuously, which is worse than failing.
+var (
+	bracketRE = regexp.MustCompile(`\[[^\]]+\]`)
+	pairRE    = regexp.MustCompile(`([a-z]+):([^\s,\]]+)`)
+)
+
+// extractCitations returns every citation in text, normalized to the canonical
+// [tier:source] form so it can be compared against Result.Cite().
+func extractCitations(text string) []string {
+	var out []string
+	for _, bracket := range bracketRE.FindAllString(text, -1) {
+		for _, p := range pairRE.FindAllStringSubmatch(bracket, -1) {
+			out = append(out, "["+p[1]+":"+p[2]+"]")
+		}
+	}
+	return out
+}
 
 // scored is one case's outcome, decomposed so a failure points at its cause.
 type answerScore struct {
@@ -190,7 +211,7 @@ func scoreAnswer(ctx context.Context, loop *agent.Loop, c answerCase, verbose bo
 	// Every marker in the answer must resolve to evidence that was actually
 	// retrieved. A marker that does not is a fabricated citation — the failure
 	// mode a grounded system exists to prevent, and invisible without this check.
-	for _, m := range citeRE.FindAllString(ans.Text, -1) {
+	for _, m := range extractCitations(ans.Text) {
 		if !cited[m] {
 			s.badCitations = append(s.badCitations, m)
 		}

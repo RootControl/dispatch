@@ -48,17 +48,35 @@ func TestFactMatchesAnyAlternative(t *testing.T) {
 	}
 }
 
-func TestCiteRegexExtractsMarkers(t *testing.T) {
+func TestExtractCitationsSingleMarkers(t *testing.T) {
 	answer := "Budget is 4M [semantic:atlas-charter.md#2] and vendor is Mailwright [relational:atlas-vendor-assessment.md#0]."
-	got := citeRE.FindAllString(answer, -1)
+	got := extractCitations(answer)
 	want := []string{"[semantic:atlas-charter.md#2]", "[relational:atlas-vendor-assessment.md#0]"}
 	if !slices.Equal(got, want) {
 		t.Errorf("markers = %v, want %v", got, want)
 	}
+}
 
-	// Bracketed prose is not a citation.
-	if m := citeRE.FindAllString("see [the appendix] and [Note: x]", -1); len(m) != 0 {
-		t.Errorf("matched non-citations: %v", m)
+// Models group citations. gemma4 emitted three in one bracket against a real
+// corpus; a single-marker regex finds none and the check passes vacuously.
+func TestExtractCitationsGroupedInOneBracket(t *testing.T) {
+	answer := "Redis uses 6380 [semantic:redis-config/README.md#0, semantic:redis-config/README.md#1, semantic:redis-config/README.md#6]."
+	got := extractCitations(answer)
+	want := []string{
+		"[semantic:redis-config/README.md#0]",
+		"[semantic:redis-config/README.md#1]",
+		"[semantic:redis-config/README.md#6]",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("grouped markers = %v, want %v", got, want)
+	}
+}
+
+func TestExtractCitationsIgnoresProse(t *testing.T) {
+	for _, s := range []string{"see [the appendix]", "[Note: revised]", "an array[0] index", "[]"} {
+		if m := extractCitations(s); len(m) != 0 {
+			t.Errorf("extractCitations(%q) = %v, want none", s, m)
+		}
 	}
 }
 

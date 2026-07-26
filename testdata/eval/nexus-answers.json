@@ -33,6 +33,18 @@
     "question": "What is this project and what is it for?",
     "must_include": [["LibreChat", "librechat"]],
     "expect_sources": ["README.md", "CLAUDE.md"],
-    "note": "open-ended; should be easy, a canary for basic retrieval"
+    "note": "open-ended; a canary — a query with no distinctive content words"
+  },
+  {
+    "question": "What does the client workspace depend on?",
+    "must_include": ["data-provider", ["packages/client", "packages/client"]],
+    "expect_sources": ["CLAUDE.md"],
+    "note": "relational: dependency edges extracted from a markdown table"
+  },
+  {
+    "question": "Which workspaces depend on data-provider?",
+    "must_include": [["client", "api"]],
+    "expect_sources": ["CLAUDE.md"],
+    "note": "relational, reverse direction — traversal is undirected"
   }
 ]

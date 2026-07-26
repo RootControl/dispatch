@@ -149,15 +149,22 @@ On the 8 bundled cases over 18 chunks with `gemma4:e4b`, all three metrics come
 out 8/8. **Read that with suspicion rather than satisfaction** — see below.
 
 Run against a real corpus (15 documents from a LibreChat checkout, 70 chunks,
-`testdata/eval/nexus-answers.json`) the numbers are more informative:
+all four tiers, `testdata/eval/nexus-answers.json`):
 
 ```
-retrieval:  6/6    facts: 7/8    citations: 6/6    end-to-end: 5/6
+retrieval:  8/8    facts: 11/11    citations: 8/8    end-to-end: 8/8
 ```
 
-The single failure is the *easiest* question — "what is this project and what is
-it for?" — and it is worth more than the five passes. See **Thinking models**
-below.
+70 chunks at `-k 4` means retrieval sees roughly a tenth of the corpus and has
+to rank, rather than returning most of it.
+
+**One of those passes is not trustworthy.** An earlier run of the same case —
+"what is this project and what is it for?", the easiest question in the set —
+failed with an empty answer, and it has since passed four times in a row under
+the same settings. Nothing was fixed in between: the model's reasoning length
+varies run to run and that question sits near its output budget. Treat it as an
+intermittent failure that happens to be passing, not a resolved one. See
+**Thinking models** below.
 
 ## Known limitations
 
@@ -174,8 +181,16 @@ Measured, not guessed:
   emitted empty content. dispatch used to pass that through as a blank answer,
   which reads like "the corpus doesn't say" when the real cause is the model.
   It is now a hard error naming the cause and the fix, and the fix is verified:
-  the same question answers correctly at `-k 2`. If you see it, lower `-k`,
-  shorten chunks, or use a non-thinking model.
+  the same question answers correctly at `-k 2`.
+
+  It is **intermittent**, which makes it worse rather than better: the same
+  question at the same `-k` has since passed four consecutive times. Sampling
+  decides whether the model reasons its way past the limit. Anything that grows
+  the prompt raises the odds — a larger `-k`, larger chunks, more registered
+  tiers, or the loop refining and carrying a second round of evidence into
+  generation. The agent loop can therefore push a model over its budget by
+  working correctly. If you see it, lower `-k`, shorten chunks, or use a
+  non-thinking model.
 - **Vague queries retrieve noise.** "What is this project and what is it for?"
   has no distinctive content words, so both BM25 and the embedding latch onto
   incidental matches — the top hit was a translations how-to that merely says

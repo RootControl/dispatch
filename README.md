@@ -289,10 +289,13 @@ percent`) so the score measures correctness rather than phrasing.
 
 Two corpora are scored, and the second is the one that means anything:
 
-| Corpus | Chunks | retrieval | facts | citations | end-to-end |
-|---|---|---|---|---|---|
-| bundled (`testdata/corpus`) | 18 | 8/8 | 14/14 | 8/8 | 8/8 |
-| real (15-doc repo checkout) | 70 | 8/8 | 11/11 | 8/8 | 8/8 |
+| Corpus | Chunks | retrieval | facts | citations | end-to-end | Time |
+|---|---|---|---|---|---|---|
+| bundled (`testdata/corpus`) | 18 | 8/8 | 14/14 | 8/8 | 8/8 | 2m44s |
+| real (15-doc repo checkout) | 70 | 8/8 | 11/11 | 8/8 | 8/8 | 4m56s |
+
+Both with the recommended pairing — `qwen2.5:7b` answering, `llama3.2:3b` for
+the mechanical passes.
 
 Both at `-k 4` over semantic + hierarchical + relational. The structured tier is
 absent from these runs because it needs `--sql-dir`; it is exercised separately
@@ -324,13 +327,18 @@ against a corpus written for them, and at `-k 4` across three tiers up to 12 of
 at 70 chunks shows about a tenth of the corpus per query, which is a genuine
 ranking test.
 
-**Neither score should be read as "it works".** Two specific reasons:
+**Neither score should be read as "it works".** The reason is not the one it
+used to be. An earlier run failed on "what is this project and what is it for?"
+with an empty answer, and passed on retry with nothing changed — an intermittent
+failure, which is worse than a consistent one. That is now understood and fixed
+rather than merely absent: it was a reasoning model exhausting its output budget
+before answering, and the recommended answering model emits no reasoning tokens
+at all, so the mechanism is gone rather than unobserved. The case has passed four
+consecutive times on the real corpus under the new configuration.
 
-1. **One real-corpus pass is untrustworthy.** "What is this project and what is
-   it for?" — the easiest question in the set — failed earlier with an empty
-   answer and has since passed four consecutive times under identical settings,
-   with nothing fixed in between. See **Thinking models** below.
-2. **A perfect score is a reason to distrust the eval first.** The harness was
+What remains true:
+
+1. **A perfect score is a reason to distrust the eval first.** The harness was
    checked against negative controls before its numbers were believed: a case
    with a deliberately wrong `expect_sources` reports `RETRIEVAL` while still
    scoring `facts 1/1` — proving the two metrics are genuinely independent — and
@@ -390,14 +398,18 @@ Measured, not guessed:
   It is now a hard error naming the cause and the fix, and the fix is verified:
   the same question answers correctly at `-k 2`.
 
-  It is **intermittent**, which makes it worse rather than better: the same
-  question at the same `-k` has since passed four consecutive times. Sampling
-  decides whether the model reasons its way past the limit. Anything that grows
-  the prompt raises the odds — a larger `-k`, larger chunks, more registered
-  tiers, or the loop refining and carrying a second round of evidence into
-  generation. The agent loop can therefore push a model over its budget by
-  working correctly. If you see it, lower `-k`, shorten chunks, or use a
-  non-thinking model.
+  It was **intermittent**, which is worse than consistent: sampling decided
+  whether the model reasoned past the limit, and anything enlarging the prompt
+  raised the odds — a larger `-k`, larger chunks, more registered tiers, or the
+  loop refining and carrying a second round of evidence into generation. The
+  agent loop could push a model over its budget by working correctly.
+
+  **This is why the recommended answering model is non-thinking.** Given the same
+  prompt, `gemma4:e4b` emitted 1,242 characters of reasoning and `qwen2.5:7b`
+  emitted none. With no reasoning tokens the failure mode does not exist, rather
+  than being rare — which is the difference between a fix and a lucky run. The
+  error and its diagnostic message stay, because a hosted reasoning model can
+  still hit it.
 - **Vague queries retrieve noise.** "What is this project and what is it for?"
   has no distinctive content words, so both BM25 and the embedding latch onto
   incidental matches — the top hit was a translations how-to that merely says

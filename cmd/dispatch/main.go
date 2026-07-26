@@ -34,11 +34,6 @@ const (
 	defaultIndexPath = ".dispatch/index.json"
 	defaultCacheDir  = ".dispatch/cache"
 	defaultMemoryDir = ".dispatch/memory"
-	// defaultHierarchyPath holds the RAPTOR tree, written by `ingest --hierarchy`
-	// and registered by `ask` when present.
-	defaultHierarchyPath = ".dispatch/hierarchy.json"
-	// defaultGraphPath holds the entity graph, written by `ingest --graph`.
-	defaultGraphPath = ".dispatch/graph.json"
 	envPath          = ".env"
 )
 
@@ -74,7 +69,7 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `dispatch — agentic tiered retrieval
 
-  dispatch ingest --corpus DIR [--dry-run] [--no-context] [--chunk-tokens N] [--hierarchy] [--graph]
+  dispatch ingest --corpus DIR [--dry-run] [--no-context] [--chunk-tokens N] [--hierarchy] [--graph] [--exclude DIRS]
   dispatch ask [--trace] [--retrieve-only] [-k N] [--max-steps N] [--remember] [--sql-dir DIR] "question"
   dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]      # routing accuracy
   dispatch eval answers [--sql-dir DIR] [-k N] [-v]                    # end-to-end answer quality
@@ -111,11 +106,12 @@ func runIngest(args []string) error {
 	hierarchy := fs.Bool("hierarchy", false, "also build the RAPTOR summary tree for the hierarchical tier")
 	branching := fs.Int("branching", 5, "leaves per cluster when building the hierarchy")
 	graph := fs.Bool("graph", false, "also build the entity graph for the relational tier")
+	exclude := fs.String("exclude", "", "extra comma-separated directory names to skip (node_modules, .git, dist and friends are always skipped)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	docs, err := loadCorpus(*corpus)
+	docs, err := loadCorpus(*corpus, strings.Split(*exclude, ","))
 	if err != nil {
 		return err
 	}
@@ -156,11 +152,12 @@ func runIngest(args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := h.Save(defaultHierarchyPath); err != nil {
+		hierarchyPath := artifactPath(*indexPath, "hierarchy")
+		if err := h.Save(hierarchyPath); err != nil {
 			return err
 		}
 		fmt.Printf("hierarchy: %d levels, %d summaries (%d LLM calls) -> %s\n",
-			hstats.Levels, hstats.Summaries, hstats.LLMCalls, defaultHierarchyPath)
+			hstats.Levels, hstats.Summaries, hstats.LLMCalls, hierarchyPath)
 	}
 
 	// Also opt-in: extraction is one LLM call per chunk, cached by content hash
@@ -173,11 +170,12 @@ func runIngest(args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := rel.Save(defaultGraphPath); err != nil {
+		graphPath := artifactPath(*indexPath, "graph")
+		if err := rel.Save(graphPath); err != nil {
 			return err
 		}
 		fmt.Printf("graph: %d entities, %d relations (%d LLM calls, %d cache hits) -> %s\n",
-			gstats.Entities, gstats.Relations, gstats.LLMCalls, gstats.CacheHits, defaultGraphPath)
+			gstats.Entities, gstats.Relations, gstats.LLMCalls, gstats.CacheHits, graphPath)
 	}
 	return nil
 }
@@ -270,15 +268,43 @@ func runAsk(args []string) error {
 	return nil
 }
 
+// skipDirs are never descended into. Without this, pointing --corpus at any
+// real repository ingests its dependencies: a checkout of a Node project here
+// held 13 documents worth reading and 4,602 markdown files in total, nearly all
+// of them vendored changelogs.
+// testdata is deliberately absent: for a docs-in-repo corpus it is often
+// exactly what you want indexed.
+var skipDirs = map[string]bool{
+	"node_modules": true, ".git": true, "vendor": true, "dist": true,
+	"build": true, "target": true, ".next": true, ".venv": true,
+	"venv": true, "__pycache__": true, ".cache": true, "coverage": true,
+	".dispatch": true,
+}
+
 // loadCorpus reads .md/.txt files under dir into Docs, using the path relative
 // to dir as a stable document ID so citations survive a move of the corpus root.
-func loadCorpus(dir string) ([]core.Doc, error) {
+// Vendored and build directories are skipped; extraSkip adds to that set.
+func loadCorpus(dir string, extraSkip []string) ([]core.Doc, error) {
+	skip := make(map[string]bool, len(skipDirs)+len(extraSkip))
+	for k, v := range skipDirs {
+		skip[k] = v
+	}
+	for _, s := range extraSkip {
+		if s = strings.TrimSpace(s); s != "" {
+			skip[s] = true
+		}
+	}
+
 	var docs []core.Doc
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
+			// Never skip the root itself, even if it happens to be named "dist".
+			if path != dir && skip[d.Name()] {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		switch strings.ToLower(filepath.Ext(path)) {

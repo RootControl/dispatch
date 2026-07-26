@@ -3,7 +3,9 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/RootControl/dispatch/agent"
 	"github.com/RootControl/dispatch/core"
@@ -19,6 +21,15 @@ type stackOptions struct {
 	SQLDir    string // empty disables the structured tier
 	MaxHops   int
 	Remember  bool // enables the memory tier
+}
+
+// artifactPath names a derived artifact next to its index, so a second corpus
+// under --index does not silently overwrite the first one's tree and graph.
+// ".dispatch/index.json" + "hierarchy" -> ".dispatch/index-hierarchy.json".
+func artifactPath(indexPath, name string) string {
+	dir, base := filepath.Dir(indexPath), filepath.Base(indexPath)
+	stem := strings.TrimSuffix(base, filepath.Ext(base))
+	return filepath.Join(dir, stem+"-"+name+".json")
 }
 
 // stack is the assembled retrieval system. Both `ask` and `eval` build one, so
@@ -51,16 +62,18 @@ func buildStack(opts stackOptions) (*stack, error) {
 		},
 	}
 
-	if _, err := os.Stat(defaultHierarchyPath); err == nil {
-		h, err := tiers.LoadHierarchy(client, defaultHierarchyPath)
+	hierarchyPath := artifactPath(opts.IndexPath, "hierarchy")
+	if _, err := os.Stat(hierarchyPath); err == nil {
+		h, err := tiers.LoadHierarchy(client, hierarchyPath)
 		if err != nil {
 			return nil, fmt.Errorf("load hierarchy: %w", err)
 		}
 		st.registry[core.TierHierarchical] = h
 	}
 
-	if _, err := os.Stat(defaultGraphPath); err == nil {
-		rel, err := tiers.LoadGraph(defaultGraphPath, opts.MaxHops)
+	graphPath := artifactPath(opts.IndexPath, "graph")
+	if _, err := os.Stat(graphPath); err == nil {
+		rel, err := tiers.LoadGraph(graphPath, opts.MaxHops)
 		if err != nil {
 			return nil, fmt.Errorf("load graph: %w", err)
 		}

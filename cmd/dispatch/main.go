@@ -69,10 +69,18 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `dispatch — agentic tiered retrieval
 
-  dispatch ingest --corpus DIR [--dry-run] [--no-context] [--chunk-tokens N] [--hierarchy] [--graph] [--exclude DIRS]
-  dispatch ask [--trace] [--retrieve-only] [-k N] [--max-steps N] [--remember] [--sql-dir DIR] "question"
-  dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]      # routing accuracy
-  dispatch eval answers [--sql-dir DIR] [-k N] [-v]                    # end-to-end answer quality
+  dispatch ingest --corpus DIR [--index PATH] [--dry-run] [--no-context]
+                  [--chunk-tokens N] [--exclude DIRS] [--hierarchy] [--graph]
+
+  dispatch ask [--index PATH] [--trace] [-k N] [--max-steps N] [--llm-router]
+               [--remember] [--sql-dir DIR] [--max-hops N] [--retrieve-only] "question"
+
+  dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]   # routing accuracy
+  dispatch eval answers [--index PATH] [--cases FILE] [-k N] [-v]   # answer quality
+
+Artifacts live beside their index: --index .dispatch/x.json puts the summary tree
+at .dispatch/x-hierarchy.json and the entity graph at .dispatch/x-graph.json, so
+several corpora can coexist. Both tiers register automatically when present.
 
 Configure first:  cp .env.example .env  and fill in LLM_BASE_URL / LLM_API_KEY.
 `)

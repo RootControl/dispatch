@@ -54,13 +54,26 @@ work already done.
 ## Commands
 
 ```
-dispatch ingest --corpus DIR [--dry-run] [--no-context] [--chunk-tokens N] [--hierarchy] [--graph]
-dispatch ask [--trace] [--retrieve-only] [-k N] [--max-steps N] [--remember] [--sql-dir DIR] [--llm-router] "question"
-dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]
+dispatch ingest --corpus DIR [--index PATH] [--dry-run] [--no-context]
+                [--chunk-tokens N] [--exclude DIRS] [--hierarchy] [--graph]
+
+dispatch ask [--index PATH] [--trace] [-k N] [--max-steps N] [--llm-router]
+             [--remember] [--sql-dir DIR] [--max-hops N] [--retrieve-only] "question"
+
+dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]   # routing accuracy
+dispatch eval answers [--index PATH] [--cases FILE] [-k N] [-v]   # answer quality
 ```
 
 The hierarchical and relational tiers are opt-in at ingest time because each
 costs LLM calls; `ask` registers a tier only when its artifact exists.
+
+Artifacts live beside their index — `--index .dispatch/x.json` writes
+`.dispatch/x-hierarchy.json` and `.dispatch/x-graph.json` — so several corpora
+can coexist without overwriting each other.
+
+Pointing `--corpus` at a repository skips `node_modules`, `.git`, `dist`,
+`vendor`, `build` and similar by default; `--exclude` adds more. Without this a
+Node checkout offers 4,602 markdown files where 13 are worth reading.
 
 ## The two ideas that matter most
 

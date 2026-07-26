@@ -80,3 +80,41 @@ func TestRouteIsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// Relational questions come in two flavours. The org-chart vocabulary alone
+// misses technical corpora: over a real repository, "what does the client
+// workspace depend on?" matched nothing and fell through to semantic.
+func TestRouteDependencyQuestionsAreRelational(t *testing.T) {
+	h := Heuristic{Available: allTiers}
+	for _, q := range []string{
+		"What does the client workspace depend on?",
+		"Which packages depend on data-provider?",
+		"What are the dependencies of the api workspace?",
+		"What does packages/api require?",
+		"Which module is this built on?",
+		"What is this service part of?",
+	} {
+		got, err := h.Route(context.Background(), q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Tiers[0] != core.TierRelational {
+			t.Errorf("Route(%q) = %v (%s), want relational first", q, got.Tiers, got.Reason)
+		}
+	}
+}
+
+// The added vocabulary must not swallow questions that belong elsewhere.
+func TestRouteDependencyVocabularyDoesNotOverreach(t *testing.T) {
+	h := Heuristic{Available: allTiers}
+	for q, want := range map[string]core.Tier{
+		"Recurring themes across all docs?":       core.TierHierarchical,
+		"Total on invoice 4471?":                  core.TierStructured,
+		"What does the corpus say about caching?": core.TierSemantic,
+	} {
+		got, _ := h.Route(context.Background(), q)
+		if got.Tiers[0] != want {
+			t.Errorf("Route(%q) = %v, want %s first", q, got.Tiers, want)
+		}
+	}
+}

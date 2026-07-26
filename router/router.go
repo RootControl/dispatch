@@ -42,7 +42,18 @@ var _ Router = Heuristic{}
 // "design" and the relational tier starts eating design questions.
 var patterns = map[core.Tier]*regexp.Regexp{
 	core.TierStructured:   regexp.MustCompile(`\b(total|totals|sum|count|how many|how much|average|avg|invoice|invoices|amount|balance|revenue|price|paid|owed|due|per (month|year|quarter|day))\b`),
-	core.TierRelational:   regexp.MustCompile(`\b(who|whom|whose|reports? to|reported to|manager|managers|related to|connected to|relationship|signed|sign|approved by|works for|belongs to)\b`),
+	// Two vocabularies, because relational questions come in two flavours and
+	// the org-chart one alone misses technical corpora entirely: asked "what
+	// does the client workspace depend on?" over a real repository, this matched
+	// nothing and fell through to semantic.
+	core.TierRelational: regexp.MustCompile(`\b(` +
+		// people and documents
+		`who|whom|whose|reports? to|reported to|manager|managers|related to|connected to|` +
+		`relationship|signed|sign|approved by|works for|belongs to|` +
+		// systems and components
+		`depends? on|depended on|dependency|dependencies|requires?|imports?|` +
+		`consumed by|provided by|maintained by|owns|owned by|part of|consists of|built on` +
+		`)\b`),
 	core.TierHierarchical: regexp.MustCompile(`\b(themes?|recurring|across all|across the|overall|in general|common|trends?|summar(y|ize|ise)|patterns?|generally)\b`),
 }
 

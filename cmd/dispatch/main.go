@@ -184,7 +184,27 @@ func runIngest(args []string) error {
 		}
 		fmt.Printf("graph: %d entities, %d relations (%d LLM calls, %d cache hits) -> %s\n",
 			gstats.Entities, gstats.Relations, gstats.LLMCalls, gstats.CacheHits, graphPath)
+		// Automatic coreference is the riskiest step, so show it rather than
+		// letting merged nodes appear as if extraction produced them.
+		if n := len(gstats.Merges); n > 0 {
+			fmt.Printf("  merged %d coreferent name(s):\n", n)
+			for i, m := range gstats.Merges {
+				if i == 8 {
+					fmt.Printf("    ... and %d more\n", n-8)
+					break
+				}
+				fmt.Printf("    %q -> %q\n", m.From, m.Into)
+			}
+		}
 		// Silent truncation would read as full coverage, so say what was lost.
+		// Zero merges from zero failures means the model rejected the
+		// candidates; zero merges from many failures means coreference never
+		// ran. Those must not look the same.
+		if gstats.CorefFailures > 0 {
+			fmt.Printf("  WARNING: %d coreference adjudication(s) failed; those names were left unmerged\n",
+				gstats.CorefFailures)
+			fmt.Printf("  first failure: %v\n", gstats.CorefError)
+		}
 		if gstats.Skipped > 0 {
 			fmt.Printf("  WARNING: %d of %d chunks could not be extracted and contribute no entities\n",
 				gstats.Skipped, gstats.Chunks)

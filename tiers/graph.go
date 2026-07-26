@@ -28,6 +28,11 @@ type Graph struct {
 	Entities map[string]Entity `json:"entities"`
 	Edges    []Edge            `json:"edges"`
 	Excerpts map[string]string `json:"excerpts"` // chunk ID -> supporting text
+	// Aliases maps a merged-away variant to its canonical entity. Merging
+	// without this would make retrieval worse for the commonest phrasing:
+	// folding "atlas" into "project atlas" removes the key that a question
+	// saying only "Atlas" would match.
+	Aliases map[string]string `json:"aliases,omitempty"`
 
 	adj map[string][]int // normalized entity -> edge indices, both directions
 }
@@ -36,15 +41,15 @@ func newGraph() *Graph {
 	return &Graph{
 		Entities: map[string]Entity{},
 		Excerpts: map[string]string{},
+		Aliases:  map[string]string{},
 		adj:      map[string][]int{},
 	}
 }
 
 // normalizeEntity collapses surface variations so "The VP of Platform",
-// "VP of Platform" and "vp of platform" resolve to one node. This is the whole
-// of entity resolution here: no embedding-based coreference, no alias table.
-// It handles case and punctuation, and nothing else — "Priya" and "Priya Raman"
-// stay distinct, which is the main known limitation of this tier.
+// "VP of Platform" and "vp of platform" resolve to one node. It handles case
+// and punctuation only; coreference between different wordings is a separate
+// pass, canonicalize.
 //
 // Every non-alphanumeric rune is a SEPARATOR, not a deletion. Deleting them
 // welds words together: "packages/data-provider" became "packagesdata provider"
@@ -59,8 +64,22 @@ func normalizeEntity(name string) string {
 	return strings.TrimPrefix(strings.Join(fields, " "), "the ")
 }
 
+// isEnumeration reports whether a name is really a list the extractor failed to
+// split — "Claude 3, GPT-4.5, o1, and Gemini". These are useless as nodes and
+// actively harmful: canonicalize would absorb the genuine "Gemini" entity into
+// the list, inventing every relationship the list had.
+//
+// A comma in an entity name is overwhelmingly this failure rather than a real
+// name like "Smith, Inc.", so the whole name is dropped.
+func isEnumeration(name string) bool {
+	return strings.Contains(name, ",") || strings.Contains(strings.ToLower(name), " and ")
+}
+
 // addEntity records an entity, keeping the first display form seen.
 func (g *Graph) addEntity(name, typ string) string {
+	if isEnumeration(name) {
+		return ""
+	}
 	key := normalizeEntity(name)
 	if key == "" {
 		return ""
@@ -73,6 +92,9 @@ func (g *Graph) addEntity(name, typ string) string {
 
 // addEdge records a relationship, ignoring self-loops and exact duplicates.
 func (g *Graph) addEdge(from, to, relation, chunkID string) {
+	if isEnumeration(from) || isEnumeration(to) {
+		return
+	}
 	f, t := normalizeEntity(from), normalizeEntity(to)
 	if f == "" || t == "" || f == t {
 		return
@@ -95,6 +117,124 @@ func (g *Graph) addEdge(from, to, relation, chunkID string) {
 		g.Entities[t] = Entity{Name: strings.TrimSpace(to)}
 	}
 	g.Edges = append(g.Edges, Edge{From: f, To: t, Relation: rel, ChunkID: chunkID})
+}
+
+// Merge records one coreference decision, for reporting. Automatic merging is
+// the riskiest thing this tier does — a wrong merge invents relationships that
+// nothing downstream can detect — so every one is auditable.
+type Merge struct {
+	From string // the variant that was absorbed
+	Into string // the canonical entity
+}
+
+// maxMergeGrowth bounds how many tokens canonicalize may add when merging a
+// variant into its canonical form.
+const maxMergeGrowth = 2
+
+// canonicalize merges variants that confirm accepts. Candidate generation is
+// lexical — cheap and high-recall — while the accept/reject decision is the
+// caller's, because lexical rules provably cannot make it.
+//
+// The proof is in the data: "atlas" -> "project atlas" and "openai" ->
+// "azure openai" are identical in shape — a unique one-token suffix
+// elaboration — and opposite in meaning. Project Atlas and Atlas are one thing;
+// OpenAI and Azure OpenAI are two. Nothing in the strings distinguishes them,
+// so a pure-lexical pass merged roughly a third of its candidates wrongly on a
+// real corpus, including that one.
+//
+// Candidates are narrowed first, so the caller adjudicates tens of pairs rather
+// than thousands:
+//
+//   - SUFFIX, not subset. English puts the head last, so a suffix shares the
+//     head noun. "infrastructure" is a subset of "infrastructure migration" but
+//     not a suffix of it, and correctly never becomes a candidate.
+//   - UNIQUENESS. A variant with more than one candidate is ambiguous and
+//     dropped. That protects "api" (a suffix of six distinct entities).
+//   - BOUNDED GROWTH. A variant is a modest elaboration, not absorption by a
+//     long phrase that happens to end with the same word.
+//
+// Not solved: forms sharing no head token. "priya" will not reach "priya raman",
+// since a first name is a prefix, and merging on prefix re-admits the failures
+// above.
+func (g *Graph) canonicalize(confirm func(short, long string) bool) []Merge {
+	candidates := map[string][]string{} // variant -> entities it is a suffix of
+	for short := range g.Entities {
+		if short == "" {
+			continue
+		}
+		shortTokens := len(strings.Fields(short))
+		for long := range g.Entities {
+			if long == short || !strings.HasSuffix(long, " "+short) {
+				continue
+			}
+			// A coreferent variant is a modest elaboration ("atlas" ->
+			// "project atlas"), not a wholly different string. Without this
+			// bound a one-word entity gets absorbed by any long phrase that
+			// happens to end with it.
+			if len(strings.Fields(long))-shortTokens > maxMergeGrowth {
+				continue
+			}
+			candidates[short] = append(candidates[short], long)
+		}
+	}
+
+	target := map[string]string{}
+	for short, longs := range candidates {
+		if len(longs) == 1 && confirm(g.display(short), g.display(longs[0])) {
+			target[short] = longs[0]
+		}
+	}
+	if len(target) == 0 {
+		return nil
+	}
+
+	// Resolve chains (a -> b -> c) to their final target, and break any cycle by
+	// giving up on it rather than looping.
+	resolve := func(k string) string {
+		seen := map[string]bool{k: true}
+		for {
+			next, ok := target[k]
+			if !ok || seen[next] {
+				return k
+			}
+			seen[next] = true
+			k = next
+		}
+	}
+
+	merges := make([]Merge, 0, len(target))
+	for short := range target {
+		final := resolve(short)
+		if final == short {
+			continue
+		}
+		merges = append(merges, Merge{From: g.display(short), Into: g.display(final)})
+		if g.Aliases == nil {
+			g.Aliases = map[string]string{}
+		}
+		g.Aliases[short] = final
+		delete(g.Entities, short)
+	}
+	sort.Slice(merges, func(i, j int) bool { return merges[i].From < merges[j].From })
+
+	// Rewrite edges onto canonical endpoints, dropping self-loops and duplicates
+	// the merge may have created.
+	seen := map[string]bool{}
+	kept := g.Edges[:0]
+	for _, e := range g.Edges {
+		e.From, e.To = resolve(e.From), resolve(e.To)
+		if e.From == e.To {
+			continue
+		}
+		key := e.From + "\x00" + e.Relation + "\x00" + e.To + "\x00" + e.ChunkID
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		kept = append(kept, e)
+	}
+	g.Edges = kept
+	return merges
 }
 
 // reindex rebuilds the adjacency map. Traversal is undirected — "Priya reports
@@ -120,6 +260,16 @@ func (g *Graph) Seeds(query string) []string {
 		}
 		if strings.Contains(q, " "+key+" ") {
 			found = append(found, key)
+		}
+	}
+	// A merged-away variant is still a valid way to name its entity, so match
+	// aliases too and resolve them to the canonical node.
+	for variant, canonical := range g.Aliases {
+		if variant == "" {
+			continue
+		}
+		if strings.Contains(q, " "+variant+" ") && !slices.Contains(found, canonical) {
+			found = append(found, canonical)
 		}
 	}
 	// Drop a seed fully contained in a longer seed: matching both "platform"

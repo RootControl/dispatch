@@ -39,6 +39,10 @@ type GraphOptions struct {
 	Cache    *index.Cache
 	CacheTag string // model identity folded into cache keys
 	MaxHops  int    // traversal depth; default 2
+	// NoCoreference disables merging coreferent entity names. Merging costs one
+	// LLM call per candidate pair (cached), and a wrong merge invents
+	// relationships, so it can be turned off.
+	NoCoreference bool
 }
 
 // GraphStats reports what building the graph cost and produced.
@@ -51,6 +55,15 @@ type GraphStats struct {
 	// Skipped counts chunks whose extraction failed. They contribute no
 	// entities, which is a smaller loss than discarding the whole build.
 	Skipped int
+	// Merges records coreference decisions, so an automatic merge can be
+	// audited rather than taken on trust.
+	Merges []Merge
+	// CorefFailures counts adjudications that errored. Zero merges from zero
+	// failures means the model rejected the candidates; zero merges from many
+	// failures means coreference did not run at all, and the two must not look
+	// the same.
+	CorefFailures int
+	CorefError    error
 	// FirstError is the first extraction failure, kept so a build that skipped
 	// chunks can explain why rather than only reporting a count.
 	FirstError error
@@ -131,6 +144,19 @@ func BuildGraph(ctx context.Context, l llm.LLM, store *index.Store, opts GraphOp
 		apply(g, ex, c.ID, c.Text)
 	}
 
+	// Coreference: lexical candidates, model adjudication. Cheap because the
+	// candidate set is tens of pairs, not thousands.
+	confirm := func(short, long string) bool { return false }
+	var corefFails *int
+	var corefErr *error
+	if !opts.NoCoreference {
+		confirm, corefFails, corefErr = confirmCoreference(ctx, l, opts.Cache, opts.CacheTag)
+	}
+	stats.Merges = g.canonicalize(confirm)
+	if corefFails != nil && *corefFails > 0 {
+		stats.CorefFailures = *corefFails
+		stats.CorefError = *corefErr
+	}
 	g.reindex()
 	stats.Entities = len(g.Entities)
 	stats.Relations = len(g.Edges)
@@ -264,6 +290,9 @@ func LoadGraph(path string, maxHops int) (*Relational, error) {
 	}
 	if g.Excerpts == nil {
 		g.Excerpts = map[string]string{}
+	}
+	if g.Aliases == nil {
+		g.Aliases = map[string]string{}
 	}
 	g.reindex()
 	return &Relational{graph: g, MaxHops: maxHops}, nil

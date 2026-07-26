@@ -431,3 +431,227 @@ func TestNormalizeEntitySeparatesPathSegments(t *testing.T) {
 		}
 	}
 }
+
+// --- coreference ---
+
+// alwaysSame isolates the lexical candidate rules from model adjudication.
+func alwaysSame(string, string) bool { return true }
+
+func TestCanonicalizeMergesUnambiguousSuffixVariants(t *testing.T) {
+	g := newGraph()
+	g.addEdge("Project Atlas", "Invoice Generation", "covers", "c1")
+	g.addEdge("Atlas", "Legacy Billing Pipeline", "replaces", "c2")
+	g.addEdge("Single External Vendor", "Statement Mailer", "serves", "c3")
+	g.addEdge("Statement Mailer", "External Vendor", "depends on", "c4")
+
+	merges := g.canonicalize(alwaysSame)
+	g.reindex()
+
+	if _, stillThere := g.Entities["atlas"]; stillThere {
+		t.Error(`"atlas" should have merged into "project atlas"`)
+	}
+	if _, ok := g.Entities["project atlas"]; !ok {
+		t.Error(`"project atlas" should survive as the canonical form`)
+	}
+	if _, stillThere := g.Entities["external vendor"]; stillThere {
+		t.Error(`"external vendor" should have merged into "single external vendor"`)
+	}
+	if len(merges) != 2 {
+		t.Errorf("expected 2 merges, got %d: %+v", len(merges), merges)
+	}
+
+	// The payoff: both variants now reach one node, so a question naming either
+	// traverses the union of their edges.
+	hits := g.Traverse(g.Seeds("what does Atlas cover and replace?"), 1)
+	chunks := map[string]bool{}
+	for _, h := range hits {
+		chunks[h.Edge.ChunkID] = true
+	}
+	if !chunks["c1"] || !chunks["c2"] {
+		t.Errorf("merged node should reach edges from both variants, got %v", chunks)
+	}
+}
+
+// The rule must refuse the cases that would fabricate relationships. Every one
+// of these is from a real corpus.
+func TestCanonicalizeRefusesAmbiguousAndModifierVariants(t *testing.T) {
+	g := newGraph()
+	// "api" is a suffix of four distinct things — merging would invent edges.
+	for _, name := range []string{"packages api", "rag api", "code interpreter api", "openai responses api"} {
+		g.addEdge(name, "Something", "used by", "c1")
+	}
+	g.addEdge("api", "Express Server", "is", "c2")
+	// "migration" is a suffix of two different migrations.
+	g.addEdge("infrastructure migration", "Q2", "slipped in", "c3")
+	g.addEdge("tax engine migration", "Later", "deferred to", "c4")
+	g.addEdge("migration", "Something Else", "relates to", "c5")
+	// "infrastructure" is a subset of "infrastructure migration" but not a
+	// suffix: infrastructure is not the migration of it.
+	g.addEdge("infrastructure", "Budget", "allocated from", "c6")
+
+	g.canonicalize(alwaysSame)
+
+	for _, mustSurvive := range []string{"api", "migration", "infrastructure"} {
+		if _, ok := g.Entities[mustSurvive]; !ok {
+			t.Errorf("%q was merged away; it is ambiguous or a modifier and must stay separate", mustSurvive)
+		}
+	}
+	if _, ok := g.Entities["packages api"]; !ok {
+		t.Error(`"packages api" must remain distinct from "api"`)
+	}
+}
+
+func TestCanonicalizeReportsMergesForAudit(t *testing.T) {
+	g := newGraph()
+	g.addEdge("Project Atlas", "Thing", "covers", "c1")
+	g.addEdge("Atlas", "Other", "replaces", "c2")
+
+	merges := g.canonicalize(alwaysSame)
+	if len(merges) != 1 {
+		t.Fatalf("expected 1 merge, got %+v", merges)
+	}
+	// Display names, not normalized keys — the report is for a human.
+	if merges[0].From != "Atlas" || merges[0].Into != "Project Atlas" {
+		t.Errorf("merge = %+v, want Atlas -> Project Atlas", merges[0])
+	}
+}
+
+// Merging must not leave an entity pointing at itself.
+func TestCanonicalizeDropsSelfLoops(t *testing.T) {
+	g := newGraph()
+	g.addEdge("Project Atlas", "Atlas", "also known as", "c1")
+	g.addEdge("Project Atlas", "Budget", "has", "c2")
+
+	g.canonicalize(alwaysSame)
+	for _, e := range g.Edges {
+		if e.From == e.To {
+			t.Errorf("self-loop survived canonicalization: %+v", e)
+		}
+	}
+}
+
+// The extractor sometimes emits a list as one entity name. Those are useless as
+// nodes and dangerous for canonicalize, which would absorb the real "Gemini"
+// into the list and inherit every relationship the list had.
+func TestEnumerationsAreRejected(t *testing.T) {
+	g := newGraph()
+	g.addEntity("Claude 3, GPT-4.5, o1, and Gemini", "other")
+	g.addEntity("Gemini", "system")
+	g.addEdge("Custom Endpoints, OpenAI, and Google", "LibreChat", "supported by", "c1")
+
+	if len(g.Entities) != 1 {
+		t.Fatalf("expected only the real entity, got %v", g.Entities)
+	}
+	if _, ok := g.Entities["gemini"]; !ok {
+		t.Error("the genuine entity should survive")
+	}
+	if len(g.Edges) != 0 {
+		t.Errorf("an edge with a list endpoint should be dropped, got %+v", g.Edges)
+	}
+}
+
+// A merge must be a modest elaboration, not absorption by a long phrase that
+// happens to end with the same word.
+func TestCanonicalizeBoundsMergeGrowth(t *testing.T) {
+	g := newGraph()
+	g.addEdge("Gemini", "Vertex", "served by", "c1")
+	g.addEdge("a very long unrelated phrase about gemini", "Something", "mentions", "c2")
+
+	g.canonicalize(alwaysSame)
+	if _, ok := g.Entities["gemini"]; !ok {
+		t.Error("gemini should not be absorbed by a much longer phrase")
+	}
+}
+
+// The adjudicator is what separates "Atlas"/"Project Atlas" from
+// "OpenAI"/"Azure OpenAI" — lexically identical, semantically opposite.
+func TestCanonicalizeRespectsAdjudicator(t *testing.T) {
+	build := func() *Graph {
+		g := newGraph()
+		g.addEdge("Project Atlas", "Budget", "has", "c1")
+		g.addEdge("Atlas", "Pipeline", "replaces", "c2")
+		g.addEdge("Azure OpenAI", "Endpoint", "provides", "c3")
+		g.addEdge("OpenAI", "Models", "provides", "c4")
+		return g
+	}
+
+	// A rejecting adjudicator merges nothing, even though both pairs are
+	// lexically identical in shape.
+	g := build()
+	if merges := g.canonicalize(func(string, string) bool { return false }); len(merges) != 0 {
+		t.Errorf("a rejecting adjudicator should merge nothing, got %+v", merges)
+	}
+
+	// A selective one merges only what it accepts.
+	g = build()
+	merges := g.canonicalize(func(short, long string) bool {
+		return !strings.Contains(long, "Azure")
+	})
+	if len(merges) != 1 || merges[0].From != "Atlas" {
+		t.Fatalf("expected only the Atlas merge, got %+v", merges)
+	}
+	if _, ok := g.Entities["openai"]; !ok {
+		t.Error("OpenAI must stay distinct from Azure OpenAI")
+	}
+}
+
+// A failed adjudication must not be read as permission to merge.
+func TestConfirmCoreferenceDefaultsToNoOnError(t *testing.T) {
+	f := &fake.LLM{ChatFunc: func([]llm.Message) (string, error) {
+		return "", errors.New("endpoint down")
+	}}
+	confirm, fails, firstErr := confirmCoreference(context.Background(), f, index.NewCache(t.TempDir()), "m1")
+	if confirm("Atlas", "Project Atlas") {
+		t.Error("an unanswered question is not a licence to merge")
+	}
+	// ...but the failure must be visible, or it looks like a considered "no".
+	// One failure per vote attempt.
+	if *fails != corefVotes || *firstErr == nil {
+		t.Errorf("failure not recorded: fails=%d err=%v", *fails, *firstErr)
+	}
+}
+
+// Verdicts are cached, so a rebuild costs nothing.
+func TestConfirmCoreferenceCachesVerdicts(t *testing.T) {
+	var calls int
+	cache := index.NewCache(t.TempDir())
+	f := &fake.LLM{ChatFunc: func([]llm.Message) (string, error) {
+		calls++
+		return `{"same": true}`, nil
+	}}
+	confirm, _, _ := confirmCoreference(context.Background(), f, cache, "m1")
+	for range 3 {
+		if !confirm("Atlas", "Project Atlas") {
+			t.Fatal("expected a merge verdict")
+		}
+	}
+	if calls != corefVotes {
+		t.Errorf("made %d calls, want %d (one vote round, rest cached)", calls, corefVotes)
+	}
+}
+
+// A stochastic judge must not decide by one sample. gemma4 answered both ways
+// on the same pair; a minority "yes" must not be enough to merge.
+func TestConfirmCoreferenceTakesMajority(t *testing.T) {
+	cases := map[string]struct {
+		replies []string
+		want    bool
+	}{
+		"unanimous yes": {[]string{"true", "true", "true"}, true},
+		"majority yes":  {[]string{"true", "false", "true"}, true},
+		"minority yes":  {[]string{"true", "false", "false"}, false},
+		"unanimous no":  {[]string{"false", "false", "false"}, false},
+	}
+	for name, tc := range cases {
+		var i int
+		f := &fake.LLM{ChatFunc: func([]llm.Message) (string, error) {
+			r := tc.replies[i%len(tc.replies)]
+			i++
+			return `{"same": ` + r + `}`, nil
+		}}
+		confirm, _, _ := confirmCoreference(context.Background(), f, index.NewCache(t.TempDir()), "m1")
+		if got := confirm("Atlas", "Project Atlas"); got != tc.want {
+			t.Errorf("%s: got %v, want %v", name, got, tc.want)
+		}
+	}
+}

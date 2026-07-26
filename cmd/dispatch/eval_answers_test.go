@@ -124,3 +124,33 @@ func TestBundledAnswerCasesAreValid(t *testing.T) {
 		}
 	}
 }
+
+// A question that refers to its source instead of naming its subject cannot
+// identify one chunk, so scoring retrieval against it measures the generator.
+// One such question was the only miss in 70 on a real corpus.
+func TestIsMetaQuestion(t *testing.T) {
+	meta := []string{
+		"What are the different Redis configurations mentioned in the passage?",
+		"What does this document describe?",
+		"Which options are listed above?",
+		"What is the section about?",
+	}
+	for _, q := range meta {
+		if !isMetaQuestion(q) {
+			t.Errorf("isMetaQuestion(%q) = false, want true", q)
+		}
+	}
+	// Content questions must survive, including ones that merely contain a
+	// preposition the filter looks for.
+	fine := []string{
+		"Which port does Redis use with TLS?",
+		"What threshold is above 90 percent?",
+		"Who signed the Mailwright contract?",
+		"What is documented in redis-config for cluster mode?",
+	}
+	for _, q := range fine {
+		if isMetaQuestion(q) {
+			t.Errorf("isMetaQuestion(%q) = true, want false", q)
+		}
+	}
+}

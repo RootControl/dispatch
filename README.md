@@ -185,12 +185,22 @@ cannot flatter the system the way an author who has read the whole corpus can,
 and every chunk gets probed rather than the eight someone chose. Questions are
 cached, so the benchmark does not quietly rewrite itself between runs.
 
-On the 18-chunk corpus, by which model wrote the context sentences:
+| Corpus | Coverage | recall@1 | recall@5 |
+|---|---|---|---|
+| bundled, 18 chunks | 18/18 | 9/18 (50%) | 17/18 (94%) |
+| real, 70 chunks | 65/70 | 35/65 (54%) | 65/65 (100%) |
 
-| Context sentences by | recall@1 | recall@5 |
-|---|---|---|
-| `gemma4:e4b` (8B) | 9/18 (50%) | 17/18 (94%) |
-| `llama3.2:3b` | 11/18 (61%) | 17/18 (94%) |
+Coverage is reported because it can be gamed. A question that refers to its
+source rather than naming its subject — "what configurations are mentioned in
+the passage?" — fits every chunk about configuration, so no retriever can pick
+the right one and scoring against it measures the generator. Those are skipped,
+which means 5 of the real corpus's 70 chunks go unmeasured. Printing 100% while
+quietly dropping the hard cases is how a benchmark flatters itself, so the
+denominator is always shown.
+
+On the bundled corpus the context sentences themselves were compared:
+`gemma4:e4b` gave recall@1 50%, `llama3.2:3b` gave 61% — the cheaper model wrote
+the better index.
 
 **This is the number the answer eval was hiding.** Both corpora score 8/8 there,
 but the top-ranked chunk is wrong roughly four times in ten — `-k 4` simply

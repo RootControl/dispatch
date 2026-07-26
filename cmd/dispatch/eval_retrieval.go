@@ -71,14 +71,18 @@ func evalRetrieval(args []string) error {
 	fmt.Printf("=== retrieval recall: %d chunks, k=%d, rerank=%v ===\n\n", len(chunks), *topK, *rerank)
 
 	ctx := context.Background()
-	var probed, hitAt1, hitAtK, generated, cached int
+	var probed, hitAt1, hitAtK, generated, cached, skipped int
 	var misses []string
 	var cases []answerCase
 
 	for _, c := range chunks {
 		q, fresh, err := needleQuestion(ctx, util, cache, utilName, c)
 		if err != nil || strings.TrimSpace(q) == "" {
-			continue // a chunk we cannot phrase a question for is not a retrieval failure
+			// No well-formed question for this chunk, so it goes unmeasured.
+			// Counted and reported: dropping chunks quietly and printing a
+			// recall over what remains is how a benchmark flatters itself.
+			skipped++
+			continue
 		}
 		if fresh {
 			generated++
@@ -128,7 +132,11 @@ func evalRetrieval(args []string) error {
 	if probed == 0 {
 		return fmt.Errorf("no chunks could be probed")
 	}
-	fmt.Printf("questions: %d generated, %d from cache\n", generated, cached)
+	fmt.Printf("coverage:  %d/%d chunks probed", probed, len(chunks))
+	if skipped > 0 {
+		fmt.Printf(" (%d skipped — no question that identifies the chunk rather than referring to it)", skipped)
+	}
+	fmt.Printf("\nquestions: %d generated, %d from cache\n", generated, cached)
 	fmt.Printf("recall@1:  %d/%d (%.0f%%)\n", hitAt1, probed, 100*float64(hitAt1)/float64(probed))
 	fmt.Printf("recall@%d:  %d/%d (%.0f%%)\n", *topK, hitAtK, probed, 100*float64(hitAtK)/float64(probed))
 
@@ -141,24 +149,59 @@ func evalRetrieval(args []string) error {
 	return nil
 }
 
+// metaPhrases mark a question that refers to its source rather than naming its
+// subject. Such a question cannot identify one chunk — "what configurations are
+// mentioned in the passage?" fits every chunk about configuration — so scoring
+// retrieval against it measures the generator, not the index. Observed once in
+// 70 on a real corpus, and it was the only miss.
+var metaPhrases = []string{
+	"the passage", "this passage", "the text", "this text",
+	"the document", "this document", "the excerpt", "this excerpt",
+	"the chunk", "this chunk", "the section", "mentioned in the",
+	"described above", "listed above", "shown above",
+}
+
+func isMetaQuestion(q string) bool {
+	lower := strings.ToLower(q)
+	for _, p := range metaPhrases {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // needleQuestion returns a question answerable from c, and whether it was
 // freshly generated.
 func needleQuestion(ctx context.Context, l llm.LLM, cache *index.Cache, tag string, c core.Chunk) (string, bool, error) {
 	key := index.Key("needle|"+tag, c.DocID, c.Text)
-	if q, ok := cache.Get(key); ok && strings.TrimSpace(q) != "" {
+	if q, ok := cache.Get(key); ok && strings.TrimSpace(q) != "" && !isMetaQuestion(q) {
 		return q, false, nil
-	}
-	var out struct {
-		Question string `json:"question"`
 	}
 	msgs := []llm.Message{
 		llm.System(needleSystem),
 		llm.User(fmt.Sprintf("<passage>\n%s\n</passage>", strings.TrimSpace(c.Text))),
 	}
-	if err := l.ChatJSON(ctx, msgs, &out); err != nil {
-		return "", false, err
+	// Retry a meta-phrased question once; the instruction not to write one is in
+	// the prompt, so a second sample usually complies rather than needing a
+	// stronger instruction.
+	var q string
+	for attempt := range 2 {
+		var out struct {
+			Question string `json:"question"`
+		}
+		if err := l.ChatJSON(ctx, msgs, &out); err != nil {
+			return "", false, err
+		}
+		q = strings.TrimSpace(out.Question)
+		if q != "" && !isMetaQuestion(q) {
+			break
+		}
+		if attempt == 1 {
+			// Still meta after a retry: skip rather than score against it.
+			return "", false, nil
+		}
 	}
-	q := strings.TrimSpace(out.Question)
 	if q != "" {
 		_ = cache.Put(key, q)
 	}

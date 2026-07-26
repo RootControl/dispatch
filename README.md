@@ -209,13 +209,18 @@ ranking test.
 Measured, not guessed:
 
 - **Entity resolution is normalization only** — case, punctuation, a leading
-  "the". Two observed consequences: the sample-corpus graph holds `atlas`,
-  `project atlas` and `project` as three separate nodes, so traversal can miss
-  paths a human would join; and `/` is dropped rather than treated as a
-  separator, so `packages/data-provider` keys as `packagesdata provider`. The
-  second is cosmetic — keys are consistent on both sides and display names keep
-  the original text — but it is fragile. Fixing either needs a rebuild, since
-  normalized keys are baked into the saved graph.
+  "the". Non-alphanumerics separate rather than delete, so
+  `packages/data-provider` keys as `packages data provider` and a question
+  written either way reaches it. What remains unsolved is coreference: the
+  sample-corpus graph still holds `atlas`, `project atlas` and `project` as
+  three separate nodes, and `priya` would not reach `priya raman`. Traversal can
+  therefore miss paths a human would join. Fixing that needs embedding-based
+  coreference or an alias table, neither of which is here.
+
+  Changing normalization does require rebuilding the graph, since normalized
+  keys are stored — but the rebuild is nearly free, because extraction is cached
+  on chunk text rather than on normalization. Re-assembling the 70-chunk graph
+  took 5 seconds and 0 LLM calls.
 - **Thinking models can spend their whole output budget reasoning and return no
   answer.** Found on the real corpus: `gemma4:e4b` given four evidence chunks
   produced 1,114 characters of reasoning, hit `finish_reason: "length"`, and

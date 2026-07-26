@@ -45,18 +45,18 @@ func newGraph() *Graph {
 // of entity resolution here: no embedding-based coreference, no alias table.
 // It handles case and punctuation, and nothing else — "Priya" and "Priya Raman"
 // stay distinct, which is the main known limitation of this tier.
+//
+// Every non-alphanumeric rune is a SEPARATOR, not a deletion. Deleting them
+// welds words together: "packages/data-provider" became "packagesdata provider"
+// and "@librechat/agents" became "librechatagents", which is unreadable and can
+// falsely merge distinct names. Splitting also lets a question written
+// "packages data provider" reach an entity written "packages/data-provider".
+// This matches the tokenizer used by BM25, so the two agree on word boundaries.
 func normalizeEntity(name string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(strings.TrimSpace(name)) {
-		switch {
-		case unicode.IsLetter(r) || unicode.IsNumber(r):
-			b.WriteRune(r)
-		case unicode.IsSpace(r) || r == '-' || r == '_':
-			b.WriteRune(' ')
-		}
-	}
-	out := strings.Join(strings.Fields(b.String()), " ")
-	return strings.TrimPrefix(out, "the ")
+	fields := strings.FieldsFunc(strings.ToLower(strings.TrimSpace(name)), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+	})
+	return strings.TrimPrefix(strings.Join(fields, " "), "the ")
 }
 
 // addEntity records an entity, keeping the first display form seen.

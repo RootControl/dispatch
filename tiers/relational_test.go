@@ -26,6 +26,14 @@ func TestNormalizeEntityCollapsesVariants(t *testing.T) {
 		{"VP of Platform.", "vp of platform"},
 		{"Data-Platform", "data platform"},
 		{"", ""},
+
+		// Punctuation separates rather than deleting. Deleting welded words
+		// together — "packages/data-provider" keyed as "packagesdata provider".
+		{"packages/data-provider", "packages data provider"},
+		{"@librechat/agents", "librechat agents"},
+		{"/client", "client"},
+		{"librechat.ai", "librechat ai"},
+		{"packages/api", "packages api"},
 	}
 	for _, c := range cases {
 		if got := normalizeEntity(c.in); got != c.want {
@@ -402,5 +410,24 @@ func TestBuildGraphSkipsUnextractableChunks(t *testing.T) {
 	// The surviving chunks must still have produced a usable graph.
 	if _, relations := rel.Stats(); relations == 0 {
 		t.Error("expected relations from the chunks that did extract")
+	}
+}
+
+// Path-like names must not weld into one token, and a question written with
+// spaces must reach an entity written with slashes.
+func TestNormalizeEntitySeparatesPathSegments(t *testing.T) {
+	if got := normalizeEntity("packages/api"); got == normalizeEntity("packagesapi") {
+		t.Errorf("packages/api and packagesapi should not collide (both %q)", got)
+	}
+	g := newGraph()
+	g.addEntity("packages/data-provider", "system")
+	for _, phrasing := range []string{
+		"what depends on packages/data-provider?",
+		"what depends on packages data provider?",
+		"What Depends On PACKAGES/DATA-PROVIDER?",
+	} {
+		if seeds := g.Seeds(phrasing); !slices.Contains(seeds, "packages data provider") {
+			t.Errorf("Seeds(%q) = %v, want the packages/data-provider entity", phrasing, seeds)
+		}
 	}
 }

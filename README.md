@@ -387,18 +387,33 @@ Measured, not guessed:
   dropped in; until then the honest setting is off. This is the clearest case in
   the project of a change that is right in principle, correctly built, and still
   a regression in practice.
-- **Concurrency in the evals is bounded by the server, not the client.** The
-  eval loops run `--jobs` items at once (default 4) and the LLM client has its
-  own semaphore, but Ollama serves one request at a time for a large model:
-  measured, four concurrent `gemma4:e4b` calls took 3.3s against 0.6s for one —
-  no speedup at all — while `llama3.2:3b` parallelised cleanly. Parallelising
-  the answer eval therefore moved it 5m27s to 4m58s, about 9%, not the ~4x the
-  arithmetic suggested. The gain that did appear came from the utility-model
-  calls.
+- **Concurrency is bounded by the server, and then by memory.** The eval loops
+  run `--jobs` items at once (default 4), but Ollama defaults to
+  `OLLAMA_NUM_PARALLEL=1` and serves one request at a time, so client
+  concurrency alone bought 9%:
 
-  If eval latency matters, the levers are `OLLAMA_NUM_PARALLEL` (a server
-  setting, and it needs the memory to hold several context slots), a smaller
-  answering model, or a hosted endpoint — not more client concurrency.
+  | Configuration | Answer eval | vs serial |
+  |---|---|---|
+  | `--jobs 1`, `NUM_PARALLEL=1` | 5m27s | — |
+  | `--jobs 4`, `NUM_PARALLEL=1` | 4m58s | 9% |
+  | `--jobs 4`, `NUM_PARALLEL=2` | 4m17s | 21% |
+
+  Raising it helps, but far less than it should. Two concurrent `gemma4:e4b`
+  calls in isolation ran 2.15x faster than serial; inside the eval that became
+  21%. The gap is memory — a 9.6 GB model, a second context slot and the
+  embedding model on a 17 GB machine leaves nothing spare, and each case is
+  internally sequential anyway (judge must finish before generate).
+
+  `OLLAMA_NUM_PARALLEL` is read by the server at startup, so it needs the Ollama
+  app restarted rather than an exported shell variable — and on macOS the app
+  spawns its server with a curated environment that ignores `launchctl setenv`.
+  Note also that a separately-installed `ollama` CLI may be older than the one
+  the app bundles: mine could not load `gemma4` at all
+  (`unknown model architecture`). Use
+  `/Applications/Ollama.app/Contents/Resources/ollama` if running the server by
+  hand.
+
+  The larger levers remain a smaller answering model or a hosted endpoint.
 - **Both eval corpora are still small** — 18 and 70 chunks. 70 is enough to make
   ranking matter; it is not enough to say anything about behaviour at 10,000,
   where a flat cosine scan and an in-memory graph both stop being reasonable.

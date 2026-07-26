@@ -1,0 +1,50 @@
+[
+  {
+    "question": "Which vendor provides the statement mailer, and who signed the current contract?",
+    "must_include": ["Mailwright", ["VP of Platform", "VP Platform"]],
+    "expect_sources": ["atlas-vendor-assessment.md"],
+    "note": "two facts in one document; the graph should also reach it"
+  },
+  {
+    "question": "Why was Parcelex not retained as a vendor?",
+    "must_include": [["fourteen percent", "14 percent", "14%"], ["SOC 2", "SOC2"]],
+    "expect_sources": ["atlas-vendor-assessment.md"],
+    "note": "two distinct reasons, both required"
+  },
+  {
+    "question": "What is the approved Atlas budget, and how much has been spent to date?",
+    "must_include": [["four million", "4 million", "4,000,000"], ["1.4 million", "one point four million", "1,400,000"]],
+    "expect_sources": ["atlas-charter.md", "atlas-status-q2.md"],
+    "note": "cross-document: budget in the charter, spend in the status report"
+  },
+  {
+    "question": "Who leads the reconciliation workstream, and who do they report to?",
+    "must_include": ["Marcus Webb", "Priya Raman"],
+    "expect_sources": ["atlas-staffing.md"],
+    "note": "relational: a reporting chain"
+  },
+  {
+    "question": "What did the steering group decide about the tax engine?",
+    "must_include": [["deferred", "defer", "stays deferred"]],
+    "expect_sources": ["atlas-steering-2026-03.md"],
+    "note": "specific decision from meeting notes"
+  },
+  {
+    "question": "What percentage of historical invoices are malformed, and who is scoping the cleanup?",
+    "must_include": [["two percent", "2 percent", "2%"], "Aisha Okonkwo"],
+    "expect_sources": ["atlas-risks.md", "atlas-steering-2026-03.md"],
+    "note": "cross-document: the figure is in the risk register, the owner in the minutes"
+  },
+  {
+    "question": "How complete is payment reconciliation, and why is it behind plan?",
+    "must_include": [["forty percent", "40 percent", "40%"], ["migration slipped", "infrastructure migration"]],
+    "expect_sources": ["atlas-status-q2.md"],
+    "note": "a figure plus its stated cause"
+  },
+  {
+    "question": "How much of the contingency reserve is still held back?",
+    "must_include": [["six percent", "6 percent", "6%"]],
+    "expect_sources": ["atlas-steering-2026-03.md"],
+    "note": "a figure that only appears after a stated change; the charter's twelve percent is stale"
+  }
+]

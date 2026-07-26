@@ -27,7 +27,6 @@ import (
 	"github.com/RootControl/dispatch/index"
 	"github.com/RootControl/dispatch/internal/envfile"
 	"github.com/RootControl/dispatch/llm"
-	"github.com/RootControl/dispatch/router"
 	"github.com/RootControl/dispatch/tiers"
 )
 
@@ -77,7 +76,8 @@ func usage() {
 
   dispatch ingest --corpus DIR [--dry-run] [--no-context] [--chunk-tokens N] [--hierarchy] [--graph]
   dispatch ask [--trace] [--retrieve-only] [-k N] [--max-steps N] [--remember] [--sql-dir DIR] "question"
-  dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]
+  dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]      # routing accuracy
+  dispatch eval answers [--sql-dir DIR] [-k N] [-v]                    # end-to-end answer quality
 
 Configure first:  cp .env.example .env  and fill in LLM_BASE_URL / LLM_API_KEY.
 `)
@@ -201,80 +201,22 @@ func runAsk(args []string) error {
 		return fmt.Errorf("ask what? provide a question")
 	}
 
-	store, client, err := newStore(false, 0) // retrieval doesn't contextualize
+	st, err := buildStack(stackOptions{
+		IndexPath: *indexPath,
+		SQLDir:    *sqlDir,
+		MaxHops:   *maxHops,
+		Remember:  *remember,
+	})
 	if err != nil {
 		return err
 	}
-	if err := store.Load(*indexPath); err != nil {
-		return fmt.Errorf("load index (run `dispatch ingest` first): %w", err)
-	}
-
-	// Registry of live tiers. The router only routes to what is registered here;
-	// the remaining three tiers land in later milestones.
-	registry := map[core.Tier]core.Retriever{
-		core.TierSemantic: tiers.NewSemantic(store),
-	}
-
-	// The hierarchical tier registers itself only if a tree was built. Absence is
-	// normal, not an error — `ingest --hierarchy` is opt-in.
-	if _, err := os.Stat(defaultHierarchyPath); err == nil {
-		h, err := tiers.LoadHierarchy(client, defaultHierarchyPath)
-		if err != nil {
-			return fmt.Errorf("load hierarchy: %w", err)
-		}
-		registry[core.TierHierarchical] = h
-	}
-
-	// Likewise the relational tier: present only if `ingest --graph` was run.
-	if _, err := os.Stat(defaultGraphPath); err == nil {
-		rel, err := tiers.LoadGraph(defaultGraphPath, *maxHops)
-		if err != nil {
-			return fmt.Errorf("load graph: %w", err)
-		}
-		registry[core.TierRelational] = rel
-	}
-
-	// The structured tier needs a SQLRunner. The CSV runner here is a demo
-	// backend; production implements SQLRunner over database/sql with a role
-	// granted SELECT only.
-	if *sqlDir != "" {
-		runner, err := tiers.LoadCSVDir(*sqlDir)
-		if err != nil {
-			return fmt.Errorf("load sql tables: %w", err)
-		}
-		registry[core.TierStructured] = tiers.NewStructured(client, runner)
-	}
-
-	// Memory is opt-in: it costs an extra LLM call per question and writes to
-	// disk, neither of which should happen without being asked for.
-	var mem *agent.Memory
-	if *remember {
-		mem = agent.NewMemory(agent.MemoryConfig{
-			LLM:      client,
-			Dir:      defaultMemoryDir,
-			EmbedTag: client.EmbedModel(),
-		})
-		if err := mem.Load(); err != nil {
-			return fmt.Errorf("load memory: %w", err)
-		}
-		registry[core.TierMemory] = mem
-	}
-
-	available := make([]core.Tier, 0, len(registry))
-	for t := range registry {
-		available = append(available, t)
-	}
-	slices.Sort(available)
+	store, client, registry, mem := st.store, st.client, st.registry, st.memory
 
 	ctx := context.Background()
+	route := st.router(*llmRoute)
 
 	// --retrieve-only skips the loop entirely: route once, retrieve once, print.
 	// Useful for inspecting retrieval quality without paying for judge calls.
-	var route router.Router = router.Heuristic{Available: available}
-	if *llmRoute {
-		route = router.LLM{LLM: client, Available: available}
-	}
-
 	if *retrieveOnly {
 		decision, err := route.Route(ctx, question)
 		if err != nil {

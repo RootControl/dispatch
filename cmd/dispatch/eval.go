@@ -25,6 +25,12 @@ type evalCase struct {
 // plausible evidence from the wrong tier, and the answer looks fine. Scoring it
 // separately from retrieval keeps that failure visible.
 func runEval(args []string) error {
+	// Two evaluations, because routing and answering fail for different reasons
+	// and a combined score would hide which one broke.
+	if len(args) > 0 && args[0] == "answers" {
+		return evalAnswers(args[1:])
+	}
+
 	fs := flag.NewFlagSet("eval", flag.ExitOnError)
 	casesPath := fs.String("cases", "./testdata/eval/routing.json", "labeled routing cases")
 	which := fs.String("router", "heuristic", "which router to score: heuristic, llm, or both")

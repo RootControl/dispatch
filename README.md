@@ -98,8 +98,12 @@ go vet ./... && go test ./...
 
 Hermetic: no network, no API key, no cost.
 
-Routing accuracy is measured separately, because a misrouted question retrieves
-plausible evidence from the wrong tier and the answer still looks fine:
+Beyond that there are two evaluations against the live endpoint, kept separate
+because routing and answering fail for different reasons and a combined score
+would hide which half broke.
+
+**Routing** — a misrouted question retrieves plausible evidence from the wrong
+tier and the answer still looks fine, so this is scored on its own:
 
 ```bash
 go run ./cmd/dispatch eval --router both -v
@@ -108,6 +112,28 @@ go run ./cmd/dispatch eval --router both -v
 On the 13 bundled cases with `gemma4:e4b`: heuristic 85% top-1, LLM router 92%
 top-1 and 100% top-2. Top-2 matters because the loop fans out — a correct tier
 ranked second is still searched in the same round.
+
+**Answer quality** — end to end, reporting three numbers that need different
+fixes:
+
+```bash
+go run ./cmd/dispatch eval answers -v
+```
+
+- **retrieval** — did the expected document reach the evidence at all?
+- **facts** — given that evidence, did the answer state the required facts?
+- **citations** — did every `[tier:source]` marker resolve to evidence that was
+  actually retrieved? A marker that doesn't is a fabricated citation, the exact
+  failure a grounded system exists to prevent and one that is invisible without
+  this check.
+
+Splitting retrieval from facts is the point: a wrong answer with `retrieval ok`
+is a generation problem, and the same answer with `retrieval miss` is a chunking
+or embedding problem. Facts accept alternative surface forms (`12%`, `twelve
+percent`) so the score measures correctness rather than phrasing.
+
+On the 8 bundled cases over 18 chunks with `gemma4:e4b`, all three metrics come
+out 8/8. **Read that with suspicion rather than satisfaction** — see below.
 
 ## Known limitations
 
@@ -132,9 +158,23 @@ Measured, not guessed:
   documented `SELECT` subset so the structured tier is demonstrable without a
   driver. Anything outside the subset is a clear error, never a wrong answer.
   Production implements `SQLRunner` over `database/sql`.
-- **The bundled corpus is tiny** (2 docs, 6 chunks). Enough to exercise the
-  machinery, not enough to judge retrieval quality. Loop refinement only triggers
-  at small `-k` because one round otherwise retrieves half the corpus.
+- **The bundled corpus is small** (6 docs, 18 chunks) and the answer eval scores
+  8/8 on it. That number is weaker evidence than it looks, for three reasons
+  worth stating plainly:
+  1. The cases were written against a corpus written for them. Self-consistent
+     by construction; it shows the machinery works, not that retrieval is good.
+  2. Every case answers in `rounds 1`. At `-k 4` across three tiers, up to 12 of
+     18 chunks reach the evidence — so retrieval barely has to *rank*, and the
+     loop never has to refine. Both are the corpus being small, not the system
+     being strong.
+  3. A perfect score is a reason to distrust the eval first. The harness was
+     verified against negative controls: a case with a deliberately wrong
+     `expect_sources` reports `RETRIEVAL` while still scoring `facts 1/1`
+     (proving the two are genuinely independent), and a case demanding a fact
+     absent from the corpus reports `FACTS` with the miss named.
+
+  The real test is your own documents. Retrieval quality claims cannot be
+  settled on 18 chunks.
 
 ## Swapping in production backends
 

@@ -90,6 +90,34 @@ Pointing `--corpus` at a repository skips `node_modules`, `.git`, `dist`,
 `vendor`, `build` and similar by default; `--exclude` adds more. Without this a
 Node checkout offers 4,602 markdown files where 13 are worth reading.
 
+### Choosing models
+
+Measured on this project's own evals, same corpus, same embeddings:
+
+| Answering model | Answer eval | Routing top-1 | Judge converges | Size |
+|---|---|---|---|---|
+| `gemma4:e4b` (thinking) | 4m58s | 12/13 | 8/8 in round 1 | 9.6 GB |
+| **`qwen2.5:7b`** | **2m44s** | **12/13** | 5/8 in round 1 | **4.7 GB** |
+| `llama3.2:3b` | 1m32s | 11/13 | 0/8 in round 1 | 2.0 GB |
+
+All three scored 8/8 on answer quality, so that column cannot separate them — the
+routing eval and the judge behaviour can.
+
+`qwen2.5:7b` is the better default: it matches the thinking model's routing
+accuracy and answer quality at roughly half the wall-clock and half the memory.
+The reasoning model's advantage shows only in the judge, which converges in one
+round rather than three — that costs extra retrieval rounds but did not change
+any answer here.
+
+Size matters more than the table suggests. At 4.7 GB the answering model, the
+utility model and the embedding model all stay resident together on a 17 GB
+machine; at 9.6 GB they evict each other and reload, which is invisible in
+per-call benchmarks and expensive in real runs.
+
+`llama3.2:3b` is fastest and is a fine *utility* model, but as the answering
+model its judge never says "sufficient" — every question burns the full step
+budget — and its routing drops to 85%.
+
 ### Two models, not one
 
 `LLM_UTILITY_MODEL` routes the mechanical passes — context sentences, entity

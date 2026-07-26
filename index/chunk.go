@@ -12,6 +12,16 @@ type ChunkOptions struct {
 	TargetTokens  int  // soft max per chunk; default 800
 	OverlapTokens int  // carried between adjacent chunks; default 100
 	NoOverlap     bool // force zero overlap (used by tests for clean boundaries)
+	// MinWords drops chunks carrying less prose than this. Real corpora contain
+	// fragments that answer nothing — a file whose whole content is another
+	// filename, a block of badge markup — and each costs an LLM call to
+	// contextualise, occupies the index, and can surface as a false positive.
+	//
+	// OFF by default, because silently discarding a user's content is worse
+	// than indexing some noise: a corpus of short entries — a glossary, one-line
+	// FAQ answers — would lose them with no error and no way to notice. Opt in
+	// with `ingest --min-words`, which reports how many chunks it dropped.
+	MinWords int
 }
 
 func (o ChunkOptions) withDefaults() ChunkOptions {
@@ -28,6 +38,25 @@ func (o ChunkOptions) withDefaults() ChunkOptions {
 		o.OverlapTokens = o.TargetTokens / 4
 	}
 	return o
+}
+
+// hasProse reports whether a chunk carries enough ordinary words to answer
+// anything. Markup tokens are not counted: a block of image badges is long by
+// word count and empty of content.
+func hasProse(s string, minWords int) bool {
+	if minWords <= 0 {
+		return true
+	}
+	n := 0
+	for _, f := range strings.Fields(s) {
+		if strings.ContainsAny(f, "<>=\"/") || strings.HasPrefix(f, "!") || strings.HasPrefix(f, "[!") {
+			continue // markup, an attribute, or a badge
+		}
+		if len(strings.Trim(f, "#*`|-_()[]")) >= 2 {
+			n++
+		}
+	}
+	return n >= minWords
 }
 
 // estimateTokens approximates token count as words × 4/3, the usual rough ratio
@@ -51,11 +80,16 @@ func Split(text string, opts ChunkOptions) []string {
 	var chunks []string
 	var cur []string
 	curTok := 0
+	emit := func(text string) {
+		if hasProse(text, opts.MinWords) {
+			chunks = append(chunks, text)
+		}
+	}
 	flush := func() {
 		if len(cur) == 0 {
 			return
 		}
-		chunks = append(chunks, strings.Join(cur, "\n\n"))
+		emit(strings.Join(cur, "\n\n"))
 		cur, curTok = overlapTail(cur, opts.OverlapTokens)
 	}
 	for _, u := range units {
@@ -67,7 +101,7 @@ func Split(text string, opts ChunkOptions) []string {
 		curTok += ut
 	}
 	if len(cur) > 0 {
-		chunks = append(chunks, strings.Join(cur, "\n\n"))
+		emit(strings.Join(cur, "\n\n"))
 	}
 	return chunks
 }

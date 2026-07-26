@@ -179,6 +179,7 @@ var metaPhrases = []string{
 	"the document", "this document", "the excerpt", "this excerpt",
 	"the chunk", "this chunk", "the section", "mentioned in the",
 	"described above", "listed above", "shown above",
+	"this file", "this markdown", "name of this", "this readme",
 }
 
 func isMetaQuestion(q string) bool {

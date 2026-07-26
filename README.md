@@ -92,6 +92,17 @@ Pointing `--corpus` at a repository skips `node_modules`, `.git`, `dist`,
 `vendor`, `build` and similar by default; `--exclude` adds more. Without this a
 Node checkout offers 4,602 markdown files where 13 are worth reading.
 
+`--min-words N` skips chunks carrying less prose than that — markup and
+attribute tokens are not counted, so a block of badges is short by this measure
+however long it looks. On the real corpus `--min-words 8` skipped 2 of 70: a
+file whose whole content was `CLAUDE.md`, and a header of image badges. Both
+cost an LLM call, sat in the index, and could answer nothing.
+
+It is **off by default and reports what it drops**, because silently discarding
+a user's content is worse than indexing some noise — a corpus of short entries,
+a glossary or one-line FAQ answers, would lose them with no error and no way to
+notice.
+
 ## Models
 
 Three roles, three different requirements. Everything below was measured on this
@@ -242,14 +253,24 @@ cannot flatter the system the way an author who has read the whole corpus can,
 and every chunk gets probed rather than the eight someone chose. Questions are
 cached, so the benchmark does not quietly rewrite itself between runs.
 
-| Corpus | Coverage | recall@1 | recall@5 |
-|---|---|---|---|
-| bundled, 18 chunks | 18/18 | 9/18 (50%) | 17/18 (94%) |
-| real, 70 chunks | 65/70 | 35/65 (54%) | 65/65 (100%) |
+| Corpus | Questions by | Coverage | recall@1 | recall@5 |
+|---|---|---|---|---|
+| bundled, 18 chunks | `llama3.2:3b` | 18/18 | 50% | 94% |
+| bundled, 18 chunks | `qwen2.5:7b` | 17/18 | 53% | 94% |
+| real, 70 chunks | `llama3.2:3b` | 65/70 | 54% | 100% |
+| real, 70 chunks | `qwen2.5:7b` | 62/70 | 55% | 95% |
 
-The measurement is robust to who writes the questions: regenerating the bundled
-set with `qwen2.5:7b` instead of `llama3.2:3b` moved recall@1 from 50% to 53% and
-left recall@5 at 94%. It is measuring retrieval, not the generator.
+recall@1 is the stable number — 50-55% regardless of who writes the questions,
+which is the useful signal: **the right chunk is the top hit about half the
+time, and in the top five almost always.** Run with `-k 4` or `-k 5`; `-k 1`
+would be wrong as often as right.
+
+recall@5 moves between 94% and 100% with the question set, so read it as "about
+95%" rather than any single figure. Inspecting the real corpus's three misses
+under `qwen2.5:7b` found that two were not retrieval failures at all: one chunk
+was a file whose entire content was the string `CLAUDE.md`, the other a block of
+badge markup. Nothing could retrieve them because they answer nothing — see
+`--min-words` under Commands.
 
 Coverage is reported because it can be gamed. A question that refers to its
 source rather than naming its subject — "what configurations are mentioned in

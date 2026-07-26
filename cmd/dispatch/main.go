@@ -70,7 +70,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `dispatch — agentic tiered retrieval
 
   dispatch ingest --corpus DIR [--index PATH] [--dry-run] [--no-context]
-                  [--chunk-tokens N] [--exclude DIRS] [--hierarchy] [--graph]
+                  [--chunk-tokens N] [--min-words N] [--exclude DIRS] [--hierarchy] [--graph]
 
   dispatch ask [--index PATH] [--trace] [-k N] [--max-steps N] [--llm-router]
                [--remember] [--sql-dir DIR] [--max-hops N] [--rerank] [--retrieve-only] "question"
@@ -109,7 +109,7 @@ func utilityLLM(client *llm.Client) (*llm.Client, string, bool) {
 
 // newStore wires an index.Store to the configured endpoint. Cache and index are
 // tagged with the model names so swapping models invalidates derived data.
-func newStore(contextualize bool, chunkTokens int) (*index.Store, *llm.Client, error) {
+func newStore(contextualize bool, chunkTokens, minWords int) (*index.Store, *llm.Client, error) {
 	client, err := llm.New(llm.Config{})
 	if err != nil {
 		return nil, nil, err
@@ -125,7 +125,7 @@ func newStore(contextualize bool, chunkTokens int) (*index.Store, *llm.Client, e
 		// them rather than silently reuse another model's work.
 		CacheTag: utilName,
 		EmbedTag: client.EmbedModel(),
-		Chunk:    index.ChunkOptions{TargetTokens: chunkTokens},
+		Chunk:    index.ChunkOptions{TargetTokens: chunkTokens, MinWords: minWords},
 	})
 	return s, client, nil
 }
@@ -137,6 +137,7 @@ func runIngest(args []string) error {
 	dryRun := fs.Bool("dry-run", false, "report chunk count and expected LLM calls, then stop")
 	noContext := fs.Bool("no-context", false, "skip contextual chunking (cheaper, worse retrieval)")
 	chunkTokens := fs.Int("chunk-tokens", 0, "target chunk size in tokens (0 = default 800)")
+	minWords := fs.Int("min-words", 0, "skip chunks with fewer prose words than this (0 = keep all)")
 	hierarchy := fs.Bool("hierarchy", false, "also build the RAPTOR summary tree for the hierarchical tier")
 	branching := fs.Int("branching", 5, "leaves per cluster when building the hierarchy")
 	graph := fs.Bool("graph", false, "also build the entity graph for the relational tier")
@@ -153,9 +154,16 @@ func runIngest(args []string) error {
 		return fmt.Errorf("no .md or .txt files under %s", *corpus)
 	}
 
-	store, client, err := newStore(!*noContext, *chunkTokens)
+	store, client, err := newStore(!*noContext, *chunkTokens, *minWords)
 	if err != nil {
 		return err
+	}
+
+	if *minWords > 0 {
+		all := index.New(index.Config{LLM: client, Chunk: index.ChunkOptions{TargetTokens: *chunkTokens}})
+		if kept, total := store.Plan(docs).Chunks, all.Plan(docs).Chunks; total > kept {
+			fmt.Printf("min-words %d: skipping %d of %d chunks with no prose\n", *minWords, total-kept, total)
+		}
 	}
 
 	if *dryRun {

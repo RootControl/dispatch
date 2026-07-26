@@ -81,3 +81,29 @@ func ids(s []scored) []string {
 	}
 	return out
 }
+
+// Real corpora contain fragments that carry no answer. Observed on a repository
+// checkout: a file whose entire content was another filename, and a block of
+// badge markup — both indexed, both unretrievable, each costing an LLM call.
+func TestSplitDropsChunksWithoutProse(t *testing.T) {
+	cases := map[string]struct {
+		text string
+		want int
+	}{
+		"filename only": {"CLAUDE.md", 0},
+		"badge markup":  {`<p align="center"><a href="https://x.ai"><img src="/logo.svg" height="256"></a></p>`, 0},
+		"heading only":  {"## Configuration", 0},
+		"real prose":    {"The approved budget figure was four million dollars across three teams.", 1},
+	}
+	for name, tc := range cases {
+		got := Split(tc.text, ChunkOptions{TargetTokens: 200, NoOverlap: true, MinWords: 8})
+		if len(got) != tc.want {
+			t.Errorf("%s: got %d chunks, want %d (%q)", name, len(got), tc.want, got)
+		}
+	}
+	// Off by default: discarding a user's content silently is worse than
+	// indexing noise, so everything is kept unless asked.
+	if got := Split("CLAUDE.md", ChunkOptions{TargetTokens: 200, NoOverlap: true}); len(got) != 1 {
+		t.Errorf("filtering should be opt-in, got %v", got)
+	}
+}

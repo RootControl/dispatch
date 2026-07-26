@@ -47,7 +47,7 @@ type stack struct {
 // buildStack loads the index and registers every tier whose artifact exists.
 // A missing hierarchy or graph is normal — those are opt-in at ingest time.
 func buildStack(opts stackOptions) (*stack, error) {
-	store, client, err := newStore(false, 0) // retrieval doesn't contextualize
+	store, client, err := newStore(false, 0, 0) // retrieval doesn't contextualize
 	if err != nil {
 		return nil, err
 	}

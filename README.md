@@ -208,19 +208,26 @@ ranking test.
 
 Measured, not guessed:
 
-- **Entity resolution is normalization only** — case, punctuation, a leading
-  "the". Non-alphanumerics separate rather than delete, so
-  `packages/data-provider` keys as `packages data provider` and a question
-  written either way reaches it. What remains unsolved is coreference: the
-  sample-corpus graph still holds `atlas`, `project atlas` and `project` as
-  three separate nodes, and `priya` would not reach `priya raman`. Traversal can
-  therefore miss paths a human would join. Fixing that needs embedding-based
-  coreference or an alias table, neither of which is here.
+- **Coreference is adjudicated by the model, and it is imperfect.** Candidates
+  are lexical — a variant must be a unique token-suffix of exactly one other
+  entity, within two tokens of growth — and the merge decision goes to the LLM,
+  three votes with a majority required.
 
-  Changing normalization does require rebuilding the graph, since normalized
-  keys are stored — but the rebuild is nearly free, because extraction is cached
-  on chunk text rather than on normalization. Re-assembling the 70-chunk graph
-  took 5 seconds and 0 LLM calls.
+  A pure-lexical version was tried and rejected: on the real corpus it got about
+  a third of its 23 merges wrong, including `openai` → `azure openai`. That case
+  is the proof no lexical rule suffices — it is identical in shape to
+  `atlas` → `project atlas` and opposite in meaning. On a labeled set the
+  adjudicated version scores 7/9, with every high-stakes pair correct; the
+  errors that remain mostly leave entities split, which loses connections rather
+  than inventing them. Every merge is printed at ingest so it can be audited,
+  and `GraphOptions.NoCoreference` turns it off.
+
+  Still unsolved: forms sharing no head token. `priya` will not reach
+  `priya raman`, because a first name is a prefix, and merging on prefix
+  re-admits exactly the `api` / `packages/api` failures.
+
+  Rebuilding after any of this is nearly free — extraction is cached on chunk
+  text, so only the adjudication calls are new, and those are cached too.
 - **Thinking models can spend their whole output budget reasoning and return no
   answer.** Found on the real corpus: `gemma4:e4b` given four evidence chunks
   produced 1,114 characters of reasoning, hit `finish_reason: "length"`, and

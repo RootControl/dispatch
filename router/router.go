@@ -52,7 +52,8 @@ var patterns = map[core.Tier]*regexp.Regexp{
 		`relationship|signed|sign|approved by|works for|belongs to|` +
 		// systems and components
 		`depends? on|depended on|dependency|dependencies|requires?|imports?|` +
-		`consumed by|provided by|maintained by|owns|owned by|part of|consists of|built on` +
+		`consumed by|provides?|provided by|maintained by|owns?|owned by|part of|` +
+		`consists of|built on` +
 		`)\b`),
 	core.TierHierarchical: regexp.MustCompile(`\b(themes?|recurring|across all|across the|overall|in general|common|trends?|summar(y|ize|ise)|patterns?|generally)\b`),
 }

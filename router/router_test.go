@@ -93,6 +93,8 @@ func TestRouteDependencyQuestionsAreRelational(t *testing.T) {
 		"What does packages/api require?",
 		"Which module is this built on?",
 		"What is this service part of?",
+		"What does Aisha own?",
+		"Which vendor provides the mailer?",
 	} {
 		got, err := h.Route(context.Background(), q)
 		if err != nil {

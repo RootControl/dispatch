@@ -242,9 +242,16 @@ Measured, not guessed:
   merge is printed at ingest for audit, and `GraphOptions.NoCoreference` turns
   the whole pass off.
 
-  Still unsolved: forms sharing no head token. `priya` will not reach
-  `priya raman`, because a first name is a prefix, and merging on prefix
-  re-admits exactly the `api` / `packages/api` failures.
+  Partial personal names are handled separately, in seeding rather than
+  merging. "Who does Priya report to?" reaches `Priya Raman` even though no
+  `priya` node exists — the corpus only ever writes the full name, so there was
+  nothing to merge and the real gap was that the question matched no key.
+  Seeding is also the safer place for it: a wrong seed adds evidence that
+  hop-ranking pushes down, where a wrong merge would be permanent. It is
+  restricted to `person`-typed entities and requires the first name to be
+  unambiguous, so `packages` never seeds `packages/api` and two people sharing a
+  first name seed neither. It therefore depends on the extractor typing people
+  correctly; anyone typed otherwise keeps full-name-only matching.
 
   Two things make this fragile on a small model, both found by measurement:
   a single sample is a coin flip (gemma4 answered both ways on the same pair,

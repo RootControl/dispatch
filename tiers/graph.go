@@ -272,6 +272,12 @@ func (g *Graph) Seeds(query string) []string {
 			found = append(found, canonical)
 		}
 	}
+
+	for _, key := range g.partialNameSeeds(q) {
+		if !slices.Contains(found, key) {
+			found = append(found, key)
+		}
+	}
 	// Drop a seed fully contained in a longer seed: matching both "platform"
 	// and "vp of platform" would traverse from a vaguer node for no gain.
 	filtered := make([]string, 0, len(found))
@@ -285,6 +291,51 @@ func (g *Graph) Seeds(query string) []string {
 	}
 	sort.Strings(filtered) // deterministic traversal order
 	return filtered
+}
+
+// partialNameSeeds resolves a person referred to by part of their name:
+// "Who does Priya report to?" reaching the entity "Priya Raman". q must already
+// be a normalized query padded with spaces.
+//
+// This lives in seeding rather than in canonicalize deliberately. There is no
+// "priya" node to merge — the corpus only ever writes the full name — so the
+// gap is that a question phrased with a first name matches no key. Fixing it
+// here is also non-destructive: a wrong seed adds evidence that hop-ranking
+// pushes down, where a wrong merge would invent relationships permanently.
+//
+// Two guards keep it narrow:
+//
+//   - PEOPLE ONLY. Referring to something by part of its name is a property of
+//     personal names. Nobody writes "packages" meaning "packages/api", and
+//     allowing that would make every path prefix a seed.
+//   - UNIQUENESS. If two people share the first token, the reference is
+//     genuinely ambiguous and neither is seeded.
+//
+// It therefore depends on the extractor typing people as "person"; anyone typed
+// otherwise, or reached only through a relation endpoint (which carries no
+// type), keeps the old full-name-only behaviour.
+func (g *Graph) partialNameSeeds(q string) []string {
+	byFirstToken := map[string][]string{}
+	for key, ent := range g.Entities {
+		if ent.Type != "person" {
+			continue
+		}
+		if tokens := strings.Fields(key); len(tokens) > 1 {
+			byFirstToken[tokens[0]] = append(byFirstToken[tokens[0]], key)
+		}
+	}
+
+	var out []string
+	for first, keys := range byFirstToken {
+		if len(keys) != 1 {
+			continue // two people share this name; the reference is ambiguous
+		}
+		if strings.Contains(q, " "+first+" ") {
+			out = append(out, keys[0])
+		}
+	}
+	sort.Strings(out) // deterministic seeding order
+	return out
 }
 
 // EdgeHit is an edge reached during traversal, with the hop count at which it

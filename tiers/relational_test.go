@@ -655,3 +655,68 @@ func TestConfirmCoreferenceTakesMajority(t *testing.T) {
 		}
 	}
 }
+
+// --- partial-name seeding ---
+
+// "Who does Priya report to?" must reach "Priya Raman". The corpus only ever
+// writes the full name, so there is no "priya" node to merge — the gap is in
+// seeding.
+func TestSeedsResolvePartialPersonName(t *testing.T) {
+	g := newGraph()
+	g.addEntity("Priya Raman", "person")
+	g.addEntity("VP of Platform", "person")
+	g.addEdge("Priya Raman", "VP of Platform", "reports to", "c1")
+	g.reindex()
+
+	for _, q := range []string{
+		"Who does Priya report to?",
+		"who does priya report to",
+		"Tell me about PRIYA.",
+	} {
+		if seeds := g.Seeds(q); !slices.Contains(seeds, "priya raman") {
+			t.Errorf("Seeds(%q) = %v, want priya raman", q, seeds)
+		}
+	}
+	// The full name must still work.
+	if seeds := g.Seeds("Who does Priya Raman report to?"); !slices.Contains(seeds, "priya raman") {
+		t.Errorf("full name broke: %v", g.Seeds("Who does Priya Raman report to?"))
+	}
+	// And the edge must actually be reachable from the partial-name seed.
+	if hits := g.Traverse(g.Seeds("who does priya report to"), 1); len(hits) != 1 {
+		t.Errorf("expected to reach the reporting edge, got %d hits", len(hits))
+	}
+}
+
+// Two people sharing a first name make the reference genuinely ambiguous.
+func TestSeedsRefuseAmbiguousPartialNames(t *testing.T) {
+	g := newGraph()
+	g.addEntity("Priya Raman", "person")
+	g.addEntity("Priya Sharma", "person")
+	g.addEdge("Priya Raman", "VP of Platform", "reports to", "c1")
+
+	seeds := g.Seeds("Who does Priya report to?")
+	for _, s := range seeds {
+		if strings.HasPrefix(s, "priya") {
+			t.Errorf("ambiguous first name should seed neither, got %v", seeds)
+		}
+	}
+	// Disambiguating by surname still works.
+	if got := g.Seeds("Who does Priya Sharma report to?"); !slices.Contains(got, "priya sharma") {
+		t.Errorf("full name should still resolve: %v", got)
+	}
+}
+
+// Partial matching is for people. Allowing it generally would make every path
+// prefix a seed — "packages" would pull in "packages/api".
+func TestSeedsPartialMatchingIsPeopleOnly(t *testing.T) {
+	g := newGraph()
+	g.addEntity("packages/api", "system")
+	g.addEntity("Azure OpenAI", "org")
+
+	if got := g.Seeds("what does packages depend on?"); len(got) != 0 {
+		t.Errorf("a non-person prefix should not seed: %v", got)
+	}
+	if got := g.Seeds("tell me about azure"); len(got) != 0 {
+		t.Errorf("a non-person prefix should not seed: %v", got)
+	}
+}

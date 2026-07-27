@@ -1,23 +1,62 @@
 # dispatch
 
-Agentic, tiered retrieval in Go. Retrieval is **a loop the agent drives**, not a
-fixed pipeline stage, over a **layered store** where each tier answers a
-different *kind* of question. Zero external dependencies — stdlib only.
+Tiered retrieval in Go, **with the evals to tell you whether it works**.
+Zero dependencies — stdlib only. Runs against any OpenAI-compatible endpoint,
+including a local Ollama.
 
+Most RAG systems cannot answer a basic question about themselves: *how often is
+the top result the right one?* dispatch measures it, with no labelled data —
+it writes a question for each chunk and checks whether that chunk comes back.
+
+On its own corpora that number is **54%** at rank 1 and **~95%** in the top five.
+Which is the point: retrieve at `-k 4` or `-k 5`, never `-k 1`, and now you know
+why rather than guessing. Run it against your own documents and you will get
+your own number in a couple of minutes.
+
+Two findings from doing that here, both reproducible from this repo:
+
+- **LLM reranking made retrieval worse. Twice.** recall@5 fell from 94% to 39%
+  with a 3B model and to 88% with a 7B one — at 13x the wall-clock. It stays
+  off by default. ([why](#known-limitations))
+- **A 3B model built a better index than an 8B reasoning model**, 11x faster,
+  and a non-thinking answering model matched a reasoning one on every quality
+  measure at half the memory. ([models](#models))
+
+```bash
+go get github.com/RootControl/dispatch
 ```
-question
-   │
-   ▼
-router ──── classifies ──▶ [structured | semantic | relational | hierarchical | memory]
-   │
-   ▼
-agent loop:  route → fan-out retrieve → judge sufficiency ─┐
-   ▲                                                       │ gap?
-   └──────────── refine query toward the gap ◀─────────────┘
-   │ enough
-   ▼
-generate (cites [tier:source]) → write-back to memory
+
+```go
+client, _ := llm.New(llm.Config{}) // LLM_BASE_URL, LLM_CHAT_MODEL, LLM_EMBED_MODEL
+
+store := index.New(index.Config{LLM: client, Contextualize: true})
+store.Ingest(ctx, []core.Doc{
+    {ID: "handbook", Text: "Expenses over $500 need director approval."},
+})
+
+loop := &agent.Loop{
+    LLM:        client,
+    Router:     router.Heuristic{Available: []core.Tier{core.TierSemantic}},
+    Retrievers: map[core.Tier]core.Retriever{core.TierSemantic: tiers.NewSemantic(store)},
+}
+answer, _ := loop.Run(ctx, "What approval do large expenses need?")
+fmt.Println(answer.Text)  // cites [semantic:handbook#0]
+fmt.Println(answer.Trace) // shows every tier searched and every judge verdict
 ```
+
+Runnable version: [`examples/minimal`](examples/minimal/main.go). There is a CLI
+too — see [Commands](#commands) — but the library is the product.
+
+**`Ingest` takes `[]core.Doc`, so bring your own parser.** dispatch ships no
+format handling on purpose: point your PDF, docx, Confluence or database
+extractor at it and hand over `{ID, Text}`. The CLI reads `.md` and `.txt`
+because that is all a CLI needs to demonstrate; the library has no such limit.
+
+Everything is behind a one-method interface — `core.Retriever`, `index.Reranker`,
+`router.Router`, `tiers.SQLRunner` — so a tier, a reranker or the whole store can
+be replaced without touching anything upstream. The bundled `index.Store` is a
+flat in-memory index: fine to a few thousand chunks, and meant to be swapped for
+pgvector or DuckDB past that.
 
 ## Why not just RAG or GraphRAG
 
@@ -31,7 +70,10 @@ questions are different retrieval problems.
 | "Who does Bob report to, and what did she sign?" | relational (entity graph, multi-hop) | single chunk |
 | "Recurring themes across all docs?" | hierarchical (RAPTOR) | plain RAG (no chunk holds the answer) |
 
-## Quick start
+## Trying it from the CLI
+
+The CLI exists to demonstrate and evaluate the library — it is how you get a
+number for your own corpus without writing any code.
 
 ```bash
 cp .env.example .env      # then fill in LLM_BASE_URL and LLM_API_KEY

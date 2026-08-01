@@ -391,3 +391,74 @@ func TestBackoffIsBoundedAndIncreasing(t *testing.T) {
 		prev = d
 	}
 }
+
+// Token accounting comes from the server's own usage block, never an estimate.
+func TestUsageAccounting(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		io.WriteString(w, `{"choices":[{"message":{"content":"hi"}}],
+			"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}}`)
+	}))
+	defer srv.Close()
+
+	c, err := New(Config{BaseURL: srv.URL, ChatModel: "m", EmbedModel: "e"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := c.Usage(); u.Calls != 0 || u.Total() != 0 {
+		t.Fatalf("a fresh client reports %+v", u)
+	}
+
+	for range 3 {
+		if _, err := c.Chat(context.Background(), []Message{User("hello")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	u := c.Usage()
+	if u.Calls != 3 {
+		t.Errorf("Calls = %d, want 3", u.Calls)
+	}
+	if u.PromptTokens != 300 || u.CompletionTokens != 60 || u.Total() != 360 {
+		t.Errorf("usage = %+v, want 300 prompt and 60 completion", u)
+	}
+}
+
+// A server that omits usage must leave the counters at zero, so the caller can
+// say "not reported" rather than printing a zero that reads as "free".
+func TestUsageAbsentIsZeroNotWrong(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"choices":[{"message":{"content":"hi"}}]}`)
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, ChatModel: "m", EmbedModel: "e"})
+	if _, err := c.Chat(context.Background(), []Message{User("hello")}); err != nil {
+		t.Fatal(err)
+	}
+	u := c.Usage()
+	if u.Calls != 1 {
+		t.Errorf("Calls = %d, want the call counted even with no usage block", u.Calls)
+	}
+	if u.Total() != 0 {
+		t.Errorf("Total = %d, want 0 when the server reports nothing", u.Total())
+	}
+}
+
+// A call that spent tokens and then returned nothing usable is exactly the one
+// worth seeing in the total.
+func TestUsageCountsFailedCompletions(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"choices":[{"message":{"content":"","reasoning":"thinking hard"},
+			"finish_reason":"length"}],"usage":{"prompt_tokens":50,"completion_tokens":500}}`)
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, ChatModel: "m", EmbedModel: "e"})
+	if _, err := c.Chat(context.Background(), []Message{User("hello")}); err == nil {
+		t.Fatal("an empty completion was returned as an answer")
+	}
+	if u := c.Usage(); u.CompletionTokens != 500 {
+		t.Errorf("usage = %+v, want the 500 tokens the failed call burned", u)
+	}
+}

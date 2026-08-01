@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/RootControl/dispatch/agent"
 	"github.com/RootControl/dispatch/core"
 	"github.com/RootControl/dispatch/index"
 	"github.com/RootControl/dispatch/llm"
@@ -42,7 +43,9 @@ func evalRetrieval(args []string) error {
 	indexPath := fs.String("index", defaultIndexPath, "index to probe")
 	topK := fs.Int("k", 5, "retrieve this many; recall is measured at this depth")
 	limit := fs.Int("limit", 0, "probe at most this many chunks (0 = all)")
-	rerank := fs.Bool("rerank", false, "rescore the shortlist before measuring")
+	rerank := fs.Bool("rerank", false, "rescore the shortlist with a cross-encoder before measuring (needs RERANK_BASE_URL)")
+	rerankLLM := fs.Bool("rerank-llm", false, "rescore with the chat model instead — measured worse than no reranking")
+	hyde := fs.Bool("hyde", false, "embed a hypothetical answer alongside each probe (one call per chunk)")
 	verbose := fs.Bool("v", false, "show every probe, not just misses")
 	questionsPath := fs.String("questions", "", "write the generated questions here, as answer-eval cases")
 	jobs := fs.Int("jobs", defaultJobs, "chunks to probe concurrently")
@@ -50,7 +53,7 @@ func evalRetrieval(args []string) error {
 		return err
 	}
 
-	st, err := buildStack(stackOptions{IndexPath: *indexPath, Rerank: *rerank})
+	st, err := buildStack(stackOptions{IndexPath: *indexPath, Rerank: *rerank, RerankLLM: *rerankLLM})
 	if err != nil {
 		return err
 	}
@@ -69,7 +72,17 @@ func evalRetrieval(args []string) error {
 	cache := index.NewCache(defaultCacheDir)
 	semantic := tiers.NewSemantic(st.store)
 
-	fmt.Printf("=== retrieval recall: %d chunks, k=%d, rerank=%v ===\n\n", len(chunks), *topK, *rerank)
+	// Expansion runs on the utility model, the same one that writes the probe
+	// questions — which is fine here and worth naming: the generator sees only
+	// one chunk and the expander sees only the question, so neither knows what
+	// the right answer is.
+	var expander agent.Expander
+	if *hyde {
+		expander = &agent.HyDE{LLM: util}
+	}
+
+	fmt.Printf("=== retrieval recall: %d chunks, k=%d, rerank=%s, hyde=%v ===\n\n",
+		len(chunks), *topK, rerankLabel(*rerank, *rerankLLM), *hyde)
 
 	ctx := context.Background()
 
@@ -90,7 +103,13 @@ func evalRetrieval(args []string) error {
 			// recall over what remains is how a benchmark flatters itself.
 			return probe{skipped: true, err: err}
 		}
-		got, err := semantic.Retrieve(ctx, core.Query{Text: q, TopK: *topK})
+		query := core.Query{Text: q, TopK: *topK}
+		if expander != nil {
+			// An expander failure retrieves the query as written rather than
+			// failing the probe, matching what the loop does.
+			query.Expanded, _ = expander.Expand(ctx, q)
+		}
+		got, err := semantic.Retrieve(ctx, query)
 		if err != nil {
 			return probe{question: q, fresh: fresh, err: err}
 		}

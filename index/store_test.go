@@ -71,11 +71,11 @@ func TestContextualChunkingImprovesRetrieval(t *testing.T) {
 	const target = "atlas#1" // the budget chunk, which never says "atlas"
 	ctx := context.Background()
 
-	raw, err := buildStore(t, false).Search(ctx, "atlas budget", 4)
+	raw, err := buildStore(t, false).Search(ctx, core.Query{Text: "atlas budget", TopK: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctxual, err := buildStore(t, true).Search(ctx, "atlas budget", 4)
+	ctxual, err := buildStore(t, true).Search(ctx, core.Query{Text: "atlas budget", TopK: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,9 +142,26 @@ func TestContextCacheAvoidsRepeatCalls(t *testing.T) {
 		t.Fatalf("second ingest: CacheHits=%d LLMCalls=%d chunks=%d", st2.CacheHits, st2.LLMCalls, st2.Chunks)
 	}
 
-	// And Plan should now predict zero calls.
-	if plan := s2.Plan(docs); plan.LLMCalls != 0 || plan.CacheHits != plan.Chunks {
+	// A fresh store sharing the cache dir is what `ingest --dry-run` does in a
+	// new process: nothing is indexed yet, so every chunk is planned, and every
+	// one of them should be predicted as a cache hit rather than a call.
+	s3, _ := newStore()
+	plan := s3.Plan(docs)
+	if plan.LLMCalls != 0 || plan.CacheHits != plan.Chunks {
 		t.Fatalf("plan after cache warm: LLMCalls=%d CacheHits=%d chunks=%d", plan.LLMCalls, plan.CacheHits, plan.Chunks)
+	}
+	if plan.EmbedCalls != 0 || plan.EmbedHits != plan.Chunks {
+		t.Fatalf("plan after cache warm: EmbedCalls=%d EmbedHits=%d chunks=%d", plan.EmbedCalls, plan.EmbedHits, plan.Chunks)
+	}
+
+	// Planning against the store that already holds them is the other case:
+	// unchanged documents are skipped outright, so there is no work of any kind.
+	plan = s2.Plan(docs)
+	if plan.Unchanged != len(docs) || plan.LLMCalls != 0 || plan.EmbedCalls != 0 {
+		t.Fatalf("plan over indexed docs: Unchanged=%d LLMCalls=%d EmbedCalls=%d", plan.Unchanged, plan.LLMCalls, plan.EmbedCalls)
+	}
+	if plan.Chunks != st2.Chunks {
+		t.Fatalf("plan over indexed docs: chunks=%d want %d", plan.Chunks, st2.Chunks)
 	}
 }
 

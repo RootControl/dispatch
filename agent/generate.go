@@ -18,6 +18,11 @@ type Answer struct {
 	// Trace records how the answer was reached. Set by Loop.Run; nil for a bare
 	// Generate call.
 	Trace *Trace
+	// Citations resolves every [tier:source] marker in Text against Evidence.
+	// Set by Loop.Run. Citations.Unresolved is the one field worth checking
+	// before showing an answer to anyone: a marker that resolves to nothing is
+	// a fabricated source, and it looks exactly like a real one.
+	Citations CitationReport
 }
 
 const generateSystem = `You answer questions strictly from the evidence provided.
@@ -31,14 +36,14 @@ Rules:
 // Generate produces a cited answer from evidence. It is a single pass; the agent
 // loop calls it once retrieval is judged sufficient.
 func Generate(ctx context.Context, l llm.LLM, question string, evidence []core.Result) (string, error) {
-	return generate(ctx, l, question, "", evidence)
+	return generate(ctx, l, question, "", evidence, nil)
 }
 
 // generate is Generate plus an optional core-memory block. Memory is presented
 // separately from evidence and explicitly marked uncited: it is the agent's own
 // prior conclusion, not a retrieved source, and letting the model cite it would
 // manufacture citations that resolve to nothing.
-func generate(ctx context.Context, l llm.LLM, question, memoryBlock string, evidence []core.Result) (string, error) {
+func generate(ctx context.Context, l llm.LLM, question, memoryBlock string, evidence []core.Result, onDelta func(string)) (string, error) {
 	if len(evidence) == 0 {
 		return "", fmt.Errorf("agent: no evidence to answer from")
 	}
@@ -48,7 +53,17 @@ func generate(ctx context.Context, l llm.LLM, question, memoryBlock string, evid
 	}
 	fmt.Fprintf(&prompt, "<evidence>\n%s\n</evidence>\n\nQuestion: %s", FormatEvidence(evidence), question)
 
-	text, err := l.Chat(ctx, []llm.Message{llm.System(generateSystem), llm.User(prompt.String())})
+	msgs := []llm.Message{llm.System(generateSystem), llm.User(prompt.String())}
+
+	// Stream when the caller asked for it and the model supports it. onDelta
+	// nil means nobody is watching, so there is no reason to stream.
+	var text string
+	var err error
+	if s, ok := l.(llm.Streamer); ok && onDelta != nil {
+		text, err = s.ChatStream(ctx, msgs, onDelta)
+	} else {
+		text, err = l.Chat(ctx, msgs)
+	}
 	if err != nil {
 		return "", err
 	}

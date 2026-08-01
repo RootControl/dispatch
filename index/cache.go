@@ -3,6 +3,7 @@ package index
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 )
@@ -32,7 +33,22 @@ func Key(tag, docID, chunkText string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// VecKey derives the on-disk key for a chunk's embedding. tag is the embedding
+// model identity and text is the text actually embedded — the situating context
+// sentence included, since that is what the vector is of. No document ID: an
+// identical passage under two document IDs embeds identically, so keying on
+// content alone shares the entry rather than paying twice.
+func VecKey(tag, text string) string {
+	h := sha256.New()
+	h.Write([]byte(tag))
+	h.Write([]byte{0})
+	h.Write([]byte(text))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func (c *Cache) path(key string) string { return filepath.Join(c.dir, key+".txt") }
+
+func (c *Cache) vecPath(key string) string { return filepath.Join(c.dir, key+".vec") }
 
 // Get returns the cached value and whether it was present. A cached empty string
 // (a chunk the model declined to contextualize) is a valid hit.
@@ -66,4 +82,53 @@ func (c *Cache) Put(key, val string) error {
 		return err
 	}
 	return os.WriteFile(c.path(key), []byte(val), 0o644)
+}
+
+// GetVector returns a cached embedding. A malformed or empty entry is reported
+// as a miss rather than an error: the cost of a miss is one embedding call,
+// while returning a truncated vector would silently corrupt every ranking it
+// takes part in.
+func (c *Cache) GetVector(key string) ([]float64, bool) {
+	if c == nil {
+		return nil, false
+	}
+	data, err := os.ReadFile(c.vecPath(key))
+	if err != nil {
+		return nil, false
+	}
+	var v []float64
+	if err := json.Unmarshal(data, &v); err != nil || len(v) == 0 {
+		return nil, false
+	}
+	return v, true
+}
+
+// HasVector reports whether an embedding is cached without decoding it, for the
+// dry-run planner.
+func (c *Cache) HasVector(key string) bool {
+	if c == nil {
+		return false
+	}
+	_, err := os.Stat(c.vecPath(key))
+	return err == nil
+}
+
+// PutVector caches an embedding.
+//
+// Vectors are stored as JSON float64 rather than anything more compact on
+// purpose: a narrower encoding would make a cached run rank fractionally
+// differently from an uncached one, and reproducible eval numbers are worth
+// more here than disk. Budget roughly 15 KB per chunk at 768 dimensions.
+func (c *Cache) PutVector(key string, v []float64) error {
+	if c == nil {
+		return nil
+	}
+	if err := os.MkdirAll(c.dir, 0o755); err != nil {
+		return err
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(c.vecPath(key), data, 0o644)
 }

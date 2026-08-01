@@ -39,6 +39,11 @@ type HierarchyOptions struct {
 	// stages trained you to expect a rebuild to be cheap.
 	Cache    *index.Cache
 	CacheTag string
+	// EmbedTag identifies the embedding model. It caches the summary vectors
+	// and is recorded in the saved tree, so loading a hierarchy built under a
+	// different embedding model fails loudly instead of searching one embedding
+	// space with another's query vector.
+	EmbedTag string
 }
 
 func (o HierarchyOptions) withDefaults() HierarchyOptions {
@@ -53,10 +58,12 @@ func (o HierarchyOptions) withDefaults() HierarchyOptions {
 
 // BuildStats reports what constructing a tree cost.
 type BuildStats struct {
-	Levels    int
-	Summaries int
-	LLMCalls  int
-	CacheHits int
+	Levels     int
+	Summaries  int
+	LLMCalls   int
+	CacheHits  int
+	EmbedCalls int // summaries sent to the embedder
+	EmbedHits  int // summary vectors served from cache
 }
 
 // BuildHierarchy constructs the summary tree from a store's existing chunks,
@@ -71,7 +78,7 @@ func BuildHierarchy(ctx context.Context, l llm.LLM, leaves *index.Store, opts Hi
 		return nil, stats, fmt.Errorf("tiers: cannot build a hierarchy over an empty store")
 	}
 
-	nodes := index.New(index.Config{LLM: l})
+	nodes := index.New(index.Config{LLM: l, Cache: opts.Cache, EmbedTag: opts.EmbedTag})
 	h := &Hierarchical{nodes: nodes}
 
 	// Current level: the text and vectors being clustered. Starts as the leaves.
@@ -116,13 +123,13 @@ func BuildHierarchy(ctx context.Context, l llm.LLM, leaves *index.Store, opts Hi
 			summaries = append(summaries, s)
 		}
 
-		// One embedding call per level, not per summary.
-		embedded, err := l.Embed(ctx, summaries)
+		// One embedding call per level, not per summary, and only for the
+		// summaries whose vectors are not already cached. A cached summary that
+		// then had to be re-embedded would leave the rebuild paying per level
+		// anyway — the two caches have to cover the same work to be worth having.
+		embedded, err := embedCached(ctx, l, opts.Cache, opts.EmbedTag, summaries, &stats)
 		if err != nil {
 			return nil, stats, fmt.Errorf("tiers: embed level %d summaries: %w", level, err)
-		}
-		if len(embedded) != len(summaries) {
-			return nil, stats, fmt.Errorf("tiers: level %d: got %d vectors for %d summaries", level, len(embedded), len(summaries))
 		}
 
 		for i, s := range summaries {
@@ -141,6 +148,42 @@ func BuildHierarchy(ctx context.Context, l llm.LLM, leaves *index.Store, opts Hi
 	}
 
 	return h, stats, nil
+}
+
+// embedCached returns one vector per text, serving what it can from the cache
+// and sending the rest in a single batch.
+func embedCached(ctx context.Context, l llm.LLM, cache *index.Cache, embedTag string, texts []string, stats *BuildStats) ([][]float64, error) {
+	out := make([][]float64, len(texts))
+	var missIdx []int
+	var miss []string
+	for i, t := range texts {
+		if v, ok := cache.GetVector(index.VecKey(embedTag, t)); ok {
+			out[i] = v
+			stats.EmbedHits++
+			continue
+		}
+		missIdx = append(missIdx, i)
+		miss = append(miss, t)
+	}
+	if len(miss) == 0 {
+		return out, nil
+	}
+
+	got, err := l.Embed(ctx, miss)
+	if err != nil {
+		return nil, err
+	}
+	if len(got) != len(miss) {
+		return nil, fmt.Errorf("got %d vectors for %d texts", len(got), len(miss))
+	}
+	for j, i := range missIdx {
+		out[i] = got[j]
+		if err := cache.PutVector(index.VecKey(embedTag, miss[j]), got[j]); err != nil {
+			return nil, err
+		}
+	}
+	stats.EmbedCalls += len(miss)
+	return out, nil
 }
 
 const summarySystem = `You write a summary of related excerpts from a document collection.
@@ -170,7 +213,12 @@ func (h *Hierarchical) Retrieve(ctx context.Context, q core.Query) ([]core.Resul
 	if h.nodes.Len() == 0 {
 		return nil, nil
 	}
-	hits, err := h.nodes.Search(ctx, q.Text, q.TopK)
+	// Filter is deliberately not forwarded: summary nodes are derived from
+	// clusters that can span documents, so they carry no document metadata to
+	// match on. Hierarchical does not implement core.Filterable, so the loop
+	// skips this tier entirely when a filter is set rather than letting it
+	// return summaries from outside the filter.
+	hits, err := h.nodes.Search(ctx, core.Query{Text: q.Text, TopK: q.TopK})
 	if err != nil {
 		return nil, err
 	}

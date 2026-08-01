@@ -8,6 +8,8 @@
 # built binaries
 /dispatch
 /cmd/dispatch/dispatch
+/minimal
+/examples/minimal/minimal
 
 # go
 *.test

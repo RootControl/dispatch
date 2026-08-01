@@ -17,6 +17,9 @@ const (
 	StepJudge    StepKind = "judge"
 	StepGenerate StepKind = "generate"
 	StepRemember StepKind = "remember"
+	StepVerify   StepKind = "verify"
+	StepDiverse  StepKind = "diverse"
+	StepExpand   StepKind = "expand"
 )
 
 // Step is one recorded action. Not every field applies to every kind; the
@@ -68,6 +71,12 @@ func (t *Trace) String() string {
 			}
 		case StepGenerate:
 			fmt.Fprintf(&b, " %d evidence item(s)", s.Results)
+		case StepVerify:
+			fmt.Fprintf(&b, " %d citation(s) resolved", s.Results)
+		case StepDiverse:
+			fmt.Fprintf(&b, " %d evidence item(s) kept", s.Results)
+		case StepExpand:
+			fmt.Fprint(&b, " hypothetical passage")
 		}
 		if s.Detail != "" {
 			fmt.Fprintf(&b, " — %s", s.Detail)

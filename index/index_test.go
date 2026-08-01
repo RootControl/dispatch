@@ -28,7 +28,7 @@ func TestBM25RanksExactTermMatch(t *testing.T) {
 	bm.add("d1", "invoice 4471 total amount due")
 	bm.add("d2", "weather notes and parking logistics")
 
-	got := bm.search("invoice 4471", 0)
+	got := bm.search("invoice 4471", 0, nil)
 	if len(got) == 0 || got[0].id != "d1" {
 		t.Fatalf("expected d1 first for exact term match, got %v", ids(got))
 	}
@@ -41,8 +41,8 @@ func TestBM25RareTermScoresHigher(t *testing.T) {
 	bm.add("d1", "quarterly report summary")
 	bm.add("d2", "monthly report invoice 4471")
 
-	rare := bm.search("4471", 0)
-	common := bm.search("report", 0)
+	rare := bm.search("4471", 0, nil)
+	common := bm.search("report", 0, nil)
 	if len(rare) == 0 || len(common) == 0 {
 		t.Fatal("expected matches for both queries")
 	}

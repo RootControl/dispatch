@@ -280,3 +280,80 @@ func TestHierarchySaveLoad(t *testing.T) {
 		}
 	}
 }
+
+// The summary cache and the embedding cache have to cover the same work: a
+// rebuild that reuses cached summaries but re-embeds them still pays per level,
+// which is the cost the cache exists to remove.
+func TestBuildHierarchyCachesSummaryEmbeddings(t *testing.T) {
+	cache := index.NewCache(t.TempDir())
+	texts := []string{
+		"Budget four million dollars approved.",
+		"Contingency reserve twelve percent allocated.",
+		"Vendor contract renews every January.",
+		"Second vendor evaluated but not retained.",
+		"Schedule slipped one quarter.",
+		"Testing compressed against staging replica.",
+	}
+
+	// The tree gets its own fake so its Embeds() counts summary embeddings
+	// only, not the leaves the store already paid for. The fake embedder is a
+	// pure function of the text, so two instances agree on every vector.
+	build := func() (*fake.LLM, BuildStats) {
+		leaves := leafStore(t, summarizingFake(), texts...)
+		tree := summarizingFake()
+		_, stats, err := BuildHierarchy(context.Background(), tree, leaves, HierarchyOptions{
+			Branching: 3, Cache: cache, CacheTag: "util", EmbedTag: "e1",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tree, stats
+	}
+
+	f1, first := build()
+	if first.EmbedCalls != first.Summaries || first.EmbedHits != 0 {
+		t.Fatalf("first build: EmbedCalls=%d EmbedHits=%d summaries=%d",
+			first.EmbedCalls, first.EmbedHits, first.Summaries)
+	}
+	if f1.Embeds() != first.Summaries {
+		t.Fatalf("first build embedded %d texts, want %d summaries", f1.Embeds(), first.Summaries)
+	}
+
+	f2, second := build()
+	if second.LLMCalls != 0 || second.CacheHits != second.Summaries {
+		t.Fatalf("second build re-summarized: LLMCalls=%d CacheHits=%d summaries=%d",
+			second.LLMCalls, second.CacheHits, second.Summaries)
+	}
+	if second.EmbedCalls != 0 || second.EmbedHits != second.Summaries {
+		t.Fatalf("second build re-embedded: EmbedCalls=%d EmbedHits=%d summaries=%d",
+			second.EmbedCalls, second.EmbedHits, second.Summaries)
+	}
+	if f2.Embeds() != 0 {
+		t.Fatalf("second build embedded %d texts, want 0", f2.Embeds())
+	}
+}
+
+// A tree built under one embedding model must not load against another: its
+// summary vectors live in the first model's space, and searching them with the
+// second's query vectors returns plausible nonsense rather than failing.
+func TestLoadHierarchyRejectsMismatchedEmbedModel(t *testing.T) {
+	f := summarizingFake()
+	leaves := leafStore(t, f, "alpha one.", "beta two.", "gamma three.", "delta four.")
+	h, _, err := BuildHierarchy(context.Background(), f, leaves, HierarchyOptions{Branching: 2, EmbedTag: "model-one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "hierarchy.json")
+	if err := h.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	nodes := index.New(index.Config{LLM: f, EmbedTag: "model-two"})
+	if err := nodes.Load(path); err == nil {
+		t.Fatal("loading a tree built under a different embedding model should fail")
+	}
+	// And the matching model still loads.
+	if _, err := LoadHierarchy(f, path); err != nil {
+		t.Fatalf("loading without an embed tag should stay permissive: %v", err)
+	}
+}

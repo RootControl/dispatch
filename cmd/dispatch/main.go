@@ -69,8 +69,9 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `dispatch — agentic tiered retrieval
 
-  dispatch ingest --corpus DIR [--index PATH] [--dry-run] [--no-context]
+  dispatch ingest --corpus DIR [--index PATH] [--dry-run] [--no-context] [--full]
                   [--chunk-tokens N] [--min-words N] [--exclude DIRS] [--hierarchy] [--graph]
+                  [--utility-model NAME]
 
   dispatch ask [--index PATH] [--trace] [-k N] [--max-steps N] [--llm-router]
                [--remember] [--sql-dir DIR] [--max-hops N] [--rerank] [--retrieve-only] "question"
@@ -78,6 +79,7 @@ func usage() {
   dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]   # routing accuracy
   dispatch eval answers [--index PATH] [--cases FILE] [-k N] [-v]   # answer quality
   dispatch eval retrieval [--index PATH] [-k N] [--rerank] [-v]     # recall over every chunk
+  dispatch eval scale [--sizes N,N,N] [--queries N] [--dims N]      # latency/memory vs corpus size
 
 Artifacts live beside their index: --index .dispatch/x.json puts the summary tree
 at .dispatch/x-hierarchy.json and the entity graph at .dispatch/x-graph.json, so
@@ -96,7 +98,10 @@ Configure first:  cp .env.example .env  and fill in LLM_BASE_URL / LLM_API_KEY.
 // text. Pointing LLM_UTILITY_MODEL at something small is the largest single
 // lever on ingest cost. Unset, it is the chat model and nothing changes.
 func utilityLLM(client *llm.Client) (*llm.Client, string, bool) {
-	name := os.Getenv("LLM_UTILITY_MODEL")
+	name := utilityOverride
+	if name == "" {
+		name = os.Getenv("LLM_UTILITY_MODEL")
+	}
 	if name == "" || name == client.ChatModel() {
 		return client, client.ChatModel(), false
 	}
@@ -106,6 +111,12 @@ func utilityLLM(client *llm.Client) (*llm.Client, string, bool) {
 	}
 	return u, name, true
 }
+
+// utilityOverride is `ingest --utility-model`, which takes precedence over
+// LLM_UTILITY_MODEL. The env var configures a machine; the flag lets one ingest
+// try a cheaper model without editing .env — and since this is the largest
+// single lever on ingest cost, trying one should not require a config change.
+var utilityOverride string
 
 // newStore wires an index.Store to the configured endpoint. Cache and index are
 // tagged with the model names so swapping models invalidates derived data.
@@ -142,9 +153,12 @@ func runIngest(args []string) error {
 	branching := fs.Int("branching", 5, "leaves per cluster when building the hierarchy")
 	graph := fs.Bool("graph", false, "also build the entity graph for the relational tier")
 	exclude := fs.String("exclude", "", "extra comma-separated directory names to skip (node_modules, .git, dist and friends are always skipped)")
+	full := fs.Bool("full", false, "rebuild from scratch instead of updating the existing index")
+	utilModel := fs.String("utility-model", "", "cheaper model for context sentences, extraction and summaries (overrides LLM_UTILITY_MODEL)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	utilityOverride = *utilModel
 
 	docs, err := loadCorpus(*corpus, strings.Split(*exclude, ","))
 	if err != nil {
@@ -159,6 +173,18 @@ func runIngest(args []string) error {
 		return err
 	}
 
+	// Load whatever is already indexed so this ingest can be incremental. A
+	// missing index is the normal first run; a mismatched embedding model is
+	// not, and Load says so rather than mixing embedding spaces.
+	if !*full {
+		switch err := store.Load(*indexPath); {
+		case err == nil:
+			fmt.Printf("updating %s (%d chunks indexed)\n", *indexPath, store.Len())
+		case !os.IsNotExist(err):
+			return fmt.Errorf("%w\n(use --full to rebuild from scratch)", err)
+		}
+	}
+
 	if *minWords > 0 {
 		all := index.New(index.Config{LLM: client, Chunk: index.ChunkOptions{TargetTokens: *chunkTokens}})
 		if kept, total := store.Plan(docs).Chunks, all.Plan(docs).Chunks; total > kept {
@@ -169,14 +195,26 @@ func runIngest(args []string) error {
 	if *dryRun {
 		plan := store.Plan(docs)
 		fmt.Printf("dry run: %d docs -> %d chunks\n", plan.Docs, plan.Chunks)
+		if plan.Unchanged > 0 {
+			fmt.Printf("  unchanged, skipped:    %d of %d docs\n", plan.Unchanged, plan.Docs)
+		}
+		if stale := staleDocs(store, docs); len(stale) > 0 {
+			fmt.Printf("  gone from the corpus:  %d doc(s), to be pruned\n", len(stale))
+		}
 		fmt.Printf("  context calls to make: %d (%d already cached)\n", plan.LLMCalls, plan.CacheHits)
-		fmt.Printf("  embedding calls:       %d batch(es), %d texts\n", plan.Docs, plan.Chunks)
+		fmt.Printf("  embedding calls:       %d chunk(s) (%d already cached)\n", plan.EmbedCalls, plan.EmbedHits)
 		_, utilName, split := utilityLLM(client)
 		fmt.Printf("  chat model %s, embed model %s\n", client.ChatModel(), client.EmbedModel())
 		if split {
 			fmt.Printf("  utility model %s (context sentences, extraction, summaries)\n", utilName)
 		}
 		return nil
+	}
+
+	// Prune before ingesting: a document deleted from the corpus is still in the
+	// index, and nothing else will ever tell the index it is gone.
+	if pruned := store.Prune(docIDs(docs)); pruned > 0 {
+		fmt.Printf("pruned %d chunk(s) from documents no longer in the corpus\n", pruned)
 	}
 
 	stats, err := store.Ingest(context.Background(), docs)
@@ -186,8 +224,11 @@ func runIngest(args []string) error {
 	if err := store.Save(*indexPath); err != nil {
 		return err
 	}
-	fmt.Printf("ingested %d docs -> %d chunks (%d context calls, %d cache hits)\n",
-		stats.Docs, stats.Chunks, stats.LLMCalls, stats.CacheHits)
+	fmt.Printf("ingested %d docs -> %d chunks (%d context calls, %d cache hits; %d embedded, %d cached)\n",
+		stats.Docs, stats.Chunks, stats.LLMCalls, stats.CacheHits, stats.EmbedCalls, stats.EmbedHits)
+	if stats.Unchanged > 0 {
+		fmt.Printf("  %d of %d docs unchanged and skipped\n", stats.Unchanged, stats.Docs)
+	}
 	fmt.Printf("index written to %s\n", *indexPath)
 
 	// The tree is opt-in: it costs roughly one LLM call per cluster per level on
@@ -199,6 +240,7 @@ func runIngest(args []string) error {
 				Branching: *branching,
 				Cache:     index.NewCache(defaultCacheDir),
 				CacheTag:  utilName,
+				EmbedTag:  client.EmbedModel(),
 			})
 		if err != nil {
 			return err
@@ -207,8 +249,9 @@ func runIngest(args []string) error {
 		if err := h.Save(hierarchyPath); err != nil {
 			return err
 		}
-		fmt.Printf("hierarchy: %d levels, %d summaries (%d LLM calls, %d cache hits) -> %s\n",
-			hstats.Levels, hstats.Summaries, hstats.LLMCalls, hstats.CacheHits, hierarchyPath)
+		fmt.Printf("hierarchy: %d levels, %d summaries (%d LLM calls, %d cache hits; %d embedded, %d cached) -> %s\n",
+			hstats.Levels, hstats.Summaries, hstats.LLMCalls, hstats.CacheHits,
+			hstats.EmbedCalls, hstats.EmbedHits, hierarchyPath)
 	}
 
 	// Also opt-in: extraction is one LLM call per chunk, cached by content hash
@@ -269,7 +312,16 @@ func runAsk(args []string) error {
 	maxHops := fs.Int("max-hops", 2, "relational graph traversal depth")
 	sqlDir := fs.String("sql-dir", "", "directory of CSV tables to enable the structured (text-to-SQL) tier")
 	llmRoute := fs.Bool("llm-router", false, "classify with the model instead of keywords (falls back to keywords on failure)")
-	rerank := fs.Bool("rerank", false, "rescore the retrieved shortlist with the model before answering")
+	rerank := fs.Bool("rerank", false, "rescore the retrieved shortlist with a cross-encoder (needs RERANK_BASE_URL)")
+	rerankLLM := fs.Bool("rerank-llm", false, "rescore with the chat model instead — measured worse than no reranking; see the README")
+	var filter filterFlag
+	fs.Var(&filter, "filter", "restrict retrieval to chunks whose metadata matches, e.g. -filter path=docs/* (repeatable)")
+	stream := fs.Bool("stream", false, "print the answer as the model produces it")
+	timeout := fs.Duration("timeout", 0, "give up after this long (e.g. 90s, 2m); 0 waits forever")
+	maxCalls := fs.Int("max-calls", 0, "cap the LLM calls one question may make (0 = no cap)")
+	hyde := fs.Bool("hyde", false, "embed a hypothetical answer alongside the query (helps vague questions, costs one call per round)")
+	diverse := fs.Bool("diverse", false, "drop evidence that restates evidence already held")
+	perDoc := fs.Int("per-doc", 0, "with --diverse, cap how many evidence items one document may contribute (0 = no cap)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -284,13 +336,21 @@ func runAsk(args []string) error {
 		MaxHops:   *maxHops,
 		Remember:  *remember,
 		Rerank:    *rerank,
+		RerankLLM: *rerankLLM,
 	})
 	if err != nil {
 		return err
 	}
 	store, client, registry, mem := st.store, st.client, st.registry, st.memory
 
+	// A hung endpoint otherwise hangs the command forever: the HTTP client has a
+	// per-request timeout, and one question makes many requests.
 	ctx := context.Background()
+	if *timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *timeout)
+		defer cancel()
+	}
 	route := st.router(*llmRoute)
 
 	// --retrieve-only skips the loop entirely: route once, retrieve once, print.
@@ -303,15 +363,40 @@ func runAsk(args []string) error {
 		if *trace {
 			fmt.Printf("route [%s] -> %v (%s)\n\n", decision.Source, decision.Tiers, decision.Reason)
 		}
+		// Expansion belongs on this path too: comparing retrieval with and
+		// without it is the reason to have it, and that comparison should not
+		// require paying for judge and generate calls.
+		var expanded string
+		if *hyde {
+			util, _, _ := utilityLLM(client)
+			if expanded, err = (&agent.HyDE{LLM: util}).Expand(ctx, question); err != nil {
+				return fmt.Errorf("expand: %w", err)
+			}
+			if *trace {
+				fmt.Printf("hyde -> %s\n\n", expanded)
+			}
+		}
 		var evidence []core.Result
 		for _, t := range decision.Tiers {
-			got, err := registry[t].Retrieve(ctx, core.Query{Text: question, TopK: *topK})
+			// Same rule the loop applies: a tier that cannot honour the filter
+			// must not answer around it.
+			if _, ok := registry[t].(core.Filterable); !filter.f.Empty() && !ok {
+				if *trace {
+					fmt.Printf("skipping [%s]: does not apply metadata filters\n", t)
+				}
+				continue
+			}
+			got, err := registry[t].Retrieve(ctx, core.Query{
+				Text: question, Expanded: expanded, TopK: *topK, Filter: filter.f})
 			if err != nil {
 				return err
 			}
 			evidence = append(evidence, got...)
 		}
 		if len(evidence) == 0 {
+			if !filter.f.Empty() {
+				return fmt.Errorf("no evidence matched filter %v across %d indexed chunks", filter.f, store.Len())
+			}
 			return fmt.Errorf("no evidence retrieved from %d indexed chunks", store.Len())
 		}
 		fmt.Println(agent.FormatEvidence(evidence))
@@ -323,9 +408,22 @@ func runAsk(args []string) error {
 		Router:     route,
 		Retrievers: registry,
 		MaxSteps:   *maxSteps,
+		MaxCalls:   *maxCalls,
 		TopK:       *topK,
 		Memory:     mem,
 		WriteBack:  *remember,
+		Filter:     filter.f,
+		Diversity:  agent.Diversity{Enabled: *diverse || *perDoc > 0, PerDoc: *perDoc},
+	}
+	if *hyde {
+		// The utility model, like the other mechanical passes: writing a
+		// plausible-sounding passage is not reasoning, and this is on the path
+		// of every question.
+		util, _, _ := utilityLLM(client)
+		loop.Expander = &agent.HyDE{LLM: util}
+	}
+	if *stream {
+		loop.OnDelta = func(s string) { fmt.Print(s) }
 	}
 	answer, err := loop.Run(ctx, question)
 	if err != nil {
@@ -341,11 +439,90 @@ func runAsk(args []string) error {
 			return fmt.Errorf("save memory: %w", err)
 		}
 	}
-	fmt.Println(answer.Text)
+	// When streaming, the answer already went to stdout fragment by fragment.
+	// Printing answer.Text as well would double it.
+	if *stream {
+		fmt.Println()
+	} else {
+		fmt.Println(answer.Text)
+	}
+	// A fabricated citation looks exactly like a real one, so it goes to stderr
+	// unconditionally rather than hiding behind --trace. Piping the answer
+	// somewhere still leaves the warning where a person will see it.
+	if !answer.Citations.OK() {
+		fmt.Fprintf(os.Stderr, "\nWARNING: %d citation(s) resolve to no retrieved evidence: %s\n",
+			len(answer.Citations.Unresolved), strings.Join(answer.Citations.Unresolved, " "))
+	}
 	if *trace {
 		fmt.Printf("\n--- trace ---\n%s\n", answer.Trace)
+		// Tokens come from the server's own usage block. A server that does not
+		// report them leaves this at zero, so say "not reported" rather than
+		// printing a zero that reads as "free".
+		if u := client.Usage(); u.Total() > 0 {
+			fmt.Printf("tokens: %d prompt + %d completion = %d over %d call(s)\n",
+				u.PromptTokens, u.CompletionTokens, u.Total(), u.Calls)
+		} else {
+			fmt.Printf("tokens: not reported by the endpoint (%d call(s))\n", u.Calls)
+		}
 	}
 	return nil
+}
+
+// filterFlag collects repeated -filter key=value pairs into a core.Filter.
+type filterFlag struct{ f core.Filter }
+
+func (x *filterFlag) String() string {
+	if x == nil || len(x.f) == 0 {
+		return ""
+	}
+	pairs := make([]string, 0, len(x.f))
+	for k, v := range x.f {
+		pairs = append(pairs, k+"="+v)
+	}
+	slices.Sort(pairs)
+	return strings.Join(pairs, ",")
+}
+
+func (x *filterFlag) Set(s string) error {
+	k, v, ok := strings.Cut(s, "=")
+	if !ok || strings.TrimSpace(k) == "" {
+		return fmt.Errorf("want key=value, got %q", s)
+	}
+	if x.f == nil {
+		x.f = core.Filter{}
+	}
+	// Repeating a key would otherwise silently keep only the last one, and the
+	// filter is a safety boundary — a dropped clause widens it.
+	if prev, dup := x.f[k]; dup {
+		return fmt.Errorf("filter key %q given twice (%q then %q); only one value per key is supported", k, prev, v)
+	}
+	x.f[strings.TrimSpace(k)] = v
+	return nil
+}
+
+// docIDs lists the corpus's document IDs, which is what Prune keeps.
+func docIDs(docs []core.Doc) []string {
+	out := make([]string, len(docs))
+	for i, d := range docs {
+		out[i] = d.ID
+	}
+	return out
+}
+
+// staleDocs reports indexed documents the corpus no longer contains, so a dry
+// run can say what an ingest would prune before it prunes it.
+func staleDocs(store *index.Store, docs []core.Doc) []string {
+	live := make(map[string]bool, len(docs))
+	for _, d := range docs {
+		live[d.ID] = true
+	}
+	var stale []string
+	for _, id := range store.DocIDs() {
+		if !live[id] {
+			stale = append(stale, id)
+		}
+	}
+	return stale
 }
 
 // skipDirs are never descended into. Without this, pointing --corpus at any
@@ -400,7 +577,21 @@ func loadCorpus(dir string, extraSkip []string) ([]core.Doc, error) {
 		if err != nil {
 			rel = path
 		}
-		docs = append(docs, core.Doc{ID: rel, Text: string(b), Meta: map[string]string{"path": path}})
+		// Metadata is what `ask --filter` matches on, so record the fields a
+		// question would actually scope by. "dir" is the corpus-relative
+		// directory, which makes `-filter dir=docs*` mean what it looks like;
+		// "path" stays absolute for display and would scope by filesystem
+		// layout instead.
+		dir := filepath.ToSlash(filepath.Dir(rel))
+		if dir == "." {
+			dir = ""
+		}
+		docs = append(docs, core.Doc{ID: rel, Text: string(b), Meta: map[string]string{
+			"path": path,
+			"doc":  filepath.ToSlash(rel),
+			"dir":  dir,
+			"ext":  strings.ToLower(strings.TrimPrefix(filepath.Ext(path), ".")),
+		}})
 		return nil
 	})
 	if err != nil {

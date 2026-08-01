@@ -3,6 +3,7 @@ package index
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 
@@ -16,6 +17,11 @@ type snapshot struct {
 	EmbedModel string       `json:"embed_model"`
 	Chunks     []core.Chunk `json:"chunks"`
 	Vectors    [][]float64  `json:"vectors"`
+	// DocHashes carries the per-document fingerprints so an incremental ingest
+	// after a restart can tell unchanged documents from new ones. An older
+	// snapshot without it simply loads empty, and the next ingest re-derives
+	// every document once — correct, just not free.
+	DocHashes map[string]string `json:"doc_hashes,omitempty"`
 }
 
 // Save writes the index to path, creating parent directories as needed. Chunks
@@ -28,6 +34,7 @@ func (s *Store) Save(path string) error {
 		EmbedModel: s.opts.EmbedTag,
 		Chunks:     make([]core.Chunk, 0, len(s.vec.ids)),
 		Vectors:    make([][]float64, 0, len(s.vec.ids)),
+		DocHashes:  maps.Clone(s.docHash),
 	}
 	for i, id := range s.vec.ids {
 		snap.Chunks = append(snap.Chunks, s.chunks[id])
@@ -77,7 +84,16 @@ func (s *Store) Load(path string) error {
 	s.chunks = make(map[string]core.Chunk, len(snap.Chunks))
 	s.vec = &vectorIndex{}
 	s.bm = newBM25()
+	s.docHash = map[string]string{}
+	maps.Copy(s.docHash, snap.DocHashes)
 	for i, c := range snap.Chunks {
+		// A snapshot written before Ingest became an upsert can hold the same
+		// chunk twice. Take the first and drop the rest rather than rebuilding
+		// the duplication in memory — loading a corrupt index is the one moment
+		// where it can be repaired for free.
+		if _, dup := s.chunks[c.ID]; dup {
+			continue
+		}
 		s.chunks[c.ID] = c
 		s.vec.add(c.ID, snap.Vectors[i])
 		s.bm.add(c.ID, c.Embedded())

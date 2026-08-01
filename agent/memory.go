@@ -67,9 +67,20 @@ func NewMemory(cfg MemoryConfig) *Memory {
 
 // Memory is a Retriever over its archival store, so the agent loop can fan out
 // to remembered material exactly like any other tier.
-var _ core.Retriever = (*Memory)(nil)
+var _ core.Filterable = (*Memory)(nil)
 
 func (m *Memory) Tier() core.Tier { return core.TierMemory }
+
+// HonorsFilter: archival memory is an index.Store, so it filters on the same
+// rule as the semantic tier.
+//
+// Note what that means in practice. Takeaways are written by the agent and
+// carry none of a document's metadata, so any filter naming a document field —
+// a path, a tenant — excludes all of them. That is the intended reading: a
+// query scoped to part of the corpus should not be answered from a conclusion
+// drawn somewhere else. Attach metadata when calling Remember to opt entries
+// back in.
+func (m *Memory) HonorsFilter() {}
 
 // Retrieve searches archival memory. The core block is not searched: it is
 // already in every prompt, so returning it as evidence would duplicate it.
@@ -77,7 +88,7 @@ func (m *Memory) Retrieve(ctx context.Context, q core.Query) ([]core.Result, err
 	if m.archival.Len() == 0 {
 		return nil, nil
 	}
-	hits, err := m.archival.Search(ctx, q.Text, q.TopK)
+	hits, err := m.archival.Search(ctx, q)
 	if err != nil {
 		return nil, err
 	}

@@ -21,7 +21,8 @@ type stackOptions struct {
 	SQLDir    string // empty disables the structured tier
 	MaxHops   int
 	Remember  bool // enables the memory tier
-	Rerank    bool // rescore the retrieved shortlist with the model
+	Rerank    bool // rescore the shortlist with a cross-encoder (RERANK_BASE_URL)
+	RerankLLM bool // rescore with the chat model; measured worse than not reranking
 }
 
 // artifactPath names a derived artifact next to its index, so a second corpus
@@ -51,7 +52,21 @@ func buildStack(opts stackOptions) (*stack, error) {
 	if err != nil {
 		return nil, err
 	}
-	if opts.Rerank {
+	switch {
+	case opts.Rerank && opts.RerankLLM:
+		return nil, fmt.Errorf("choose one of --rerank and --rerank-llm")
+	case opts.Rerank:
+		// --rerank means the cross-encoder, because that is the one with a
+		// reason to work. A missing endpoint is an error rather than a fallback
+		// to the LLM reranker: measurements say that path makes retrieval
+		// worse, and silently taking it would attribute the loss to reranking
+		// in general.
+		ce, err := index.NewCrossEncoderFromEnv()
+		if err != nil {
+			return nil, fmt.Errorf("%w\n(use --rerank-llm for the chat-model reranker, which measured worse than no reranking)", err)
+		}
+		store.SetReranker(ce)
+	case opts.RerankLLM:
 		// Reranking on the utility model, not the answering one. Scoring a
 		// shortlist for relevance is a mechanical judgment, and doing it with an
 		// 8B thinking model took ~50s per query against ~2s — slow enough that
@@ -128,4 +143,17 @@ func (s *stack) router(useLLM bool) router.Router {
 		return router.LLM{LLM: s.client, Available: s.available}
 	}
 	return router.Heuristic{Available: s.available}
+}
+
+// rerankLabel names the reranker in eval output. The two paths must be
+// distinguishable in a results table: they are different enough that reporting
+// both as "rerank=true" would make the numbers uninterpretable.
+func rerankLabel(cross, viaLLM bool) string {
+	switch {
+	case cross:
+		return "cross-encoder"
+	case viaLLM:
+		return "llm"
+	}
+	return "off"
 }

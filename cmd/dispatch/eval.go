@@ -33,6 +33,9 @@ func runEval(args []string) error {
 	if len(args) > 0 && args[0] == "retrieval" {
 		return evalRetrieval(args[1:])
 	}
+	if len(args) > 0 && args[0] == "scale" {
+		return evalScale(args[1:])
+	}
 
 	fs := flag.NewFlagSet("eval", flag.ExitOnError)
 	casesPath := fs.String("cases", "./testdata/eval/routing.json", "labeled routing cases")

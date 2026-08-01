@@ -13,14 +13,23 @@ Which is the point: retrieve at `-k 4` or `-k 5`, never `-k 1`, and now you know
 why rather than guessing. Run it against your own documents and you will get
 your own number in a couple of minutes.
 
-Two findings from doing that here, both reproducible from this repo:
+Four findings from doing that here, all reproducible from this repo:
 
 - **LLM reranking made retrieval worse. Twice.** recall@5 fell from 94% to 39%
   with a 3B model and to 88% with a 7B one — at 13x the wall-clock. It stays
-  off by default. ([why](#known-limitations))
+  off by default; `--rerank` now means a purpose-built cross-encoder instead.
+  ([why](#known-limitations))
+- **HyDE query expansion did nothing, at 21x the cost.** The standard fix for
+  vague queries left recall@1 at 54% on the real corpus, cost a point of
+  recall@5, and turned 7.8s into 2m44s. Also off by default.
+  ([why](#known-limitations))
 - **A 3B model built a better index than an 8B reasoning model**, 11x faster,
   and a non-thinking answering model matched a reasoning one on every quality
   measure at half the memory. ([models](#models))
+- **The flat in-memory index is linear in both latency and memory** — 10ms and
+  87 MB at 10,000 chunks, 54ms and 431 MB at 50,000. That is the number behind
+  "swap it for pgvector past a few thousand", and
+  [`index/pgvector`](index/pgvector) is the swap. ([measured](#known-limitations))
 
 ```bash
 go get github.com/RootControl/dispatch
@@ -53,10 +62,11 @@ extractor at it and hand over `{ID, Text}`. The CLI reads `.md` and `.txt`
 because that is all a CLI needs to demonstrate; the library has no such limit.
 
 Everything is behind a one-method interface — `core.Retriever`, `index.Reranker`,
-`router.Router`, `tiers.SQLRunner` — so a tier, a reranker or the whole store can
-be replaced without touching anything upstream. The bundled `index.Store` is a
-flat in-memory index: fine to a few thousand chunks, and meant to be swapped for
-pgvector or DuckDB past that.
+`index.Searcher`, `router.Router`, `tiers.SQLRunner` — so a tier, a reranker or
+the whole store can be replaced without touching anything upstream. The bundled
+`index.Store` is a flat in-memory index, comfortable to a few thousand chunks
+([measured](#known-limitations)); [`index/pgvector`](index/pgvector) is the
+drop-in for past that, over `database/sql` with no dependency added.
 
 ## Why not just RAG or GraphRAG
 
@@ -112,15 +122,19 @@ questions about how things relate. Skip it if you only need content lookup.
 ## Commands
 
 ```
-dispatch ingest --corpus DIR [--index PATH] [--dry-run] [--no-context]
-                [--chunk-tokens N] [--exclude DIRS] [--hierarchy] [--graph]
+dispatch ingest --corpus DIR [--index PATH] [--dry-run] [--no-context] [--full]
+                [--chunk-tokens N] [--min-words N] [--exclude DIRS]
+                [--hierarchy] [--graph] [--utility-model NAME]
 
 dispatch ask [--index PATH] [--trace] [-k N] [--max-steps N] [--llm-router]
-             [--remember] [--sql-dir DIR] [--max-hops N] [--retrieve-only] "question"
+             [--remember] [--sql-dir DIR] [--max-hops N] [--filter K=V]
+             [--rerank] [--retrieve-only] [--stream] [--diverse] [--per-doc N]
+             [--hyde] [--timeout D] [--max-calls N] "question"
 
 dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]   # routing accuracy
 dispatch eval answers [--index PATH] [--cases FILE] [-k N] [-v]   # answer quality
-dispatch eval retrieval [--index PATH] [-k N] [--rerank] [-v]     # recall over every chunk
+dispatch eval retrieval [--index PATH] [-k N] [--rerank] [--hyde] [-v]  # recall over every chunk
+dispatch eval scale [--sizes N,N,N] [--queries N]                 # latency/memory vs corpus size
 ```
 
 The hierarchical and relational tiers are opt-in at ingest time because each
@@ -129,6 +143,154 @@ costs LLM calls; `ask` registers a tier only when its artifact exists.
 Artifacts live beside their index — `--index .dispatch/x.json` writes
 `.dispatch/x-hierarchy.json` and `.dispatch/x-graph.json` — so several corpora
 can coexist without overwriting each other.
+
+### Ingest is incremental
+
+`ingest` loads the existing index, re-derives only the documents that changed,
+and prunes the ones the corpus has lost. A document is unchanged when a
+fingerprint over its text, its metadata, the splitter settings and both model
+identities matches what it was last ingested under — so editing a chunk size or
+switching the utility model re-derives everything, as it must, while editing one
+file costs one file.
+
+```
+$ dispatch ingest --corpus ~/docs --index .dispatch/mine.json
+updating .dispatch/mine.json (3 chunks indexed)
+ingested 3 docs -> 3 chunks (0 context calls, 0 cache hits; 0 embedded, 0 cached)
+  3 of 3 docs unchanged and skipped
+
+$ # edit one file, add one, delete one
+$ dispatch ingest --corpus ~/docs --index .dispatch/mine.json
+pruned 1 chunk(s) from documents no longer in the corpus
+ingested 3 docs -> 3 chunks (2 context calls, 0 cache hits; 2 embedded, 0 cached)
+  1 of 3 docs unchanged and skipped
+```
+
+`--full` rebuilds from scratch. Embeddings are content-addressed in the same
+cache as context sentences, so even a full rebuild re-embeds only chunks whose
+text actually changed — budget roughly 15 KB of cache per chunk at 768
+dimensions.
+
+### Scoping a query with `--filter`
+
+`--filter key=value` restricts retrieval to chunks whose metadata matches; a
+trailing `*` matches by prefix. It is repeatable and every clause must match.
+The CLI records `path`, `doc`, `dir` and `ext` per document.
+
+```bash
+dispatch ask --filter dir=notes "who is staffed on this?"
+dispatch ask --filter 'dir=docs*' --filter ext=md "what are the risks?"
+```
+
+**A filter is enforced, not merely applied.** Only tiers backed by an
+`index.Store` — semantic and archival memory — can match on chunk metadata; the
+hierarchical, relational and structured tiers retrieve over derived artifacts
+that carry none. Rather than let those answer from outside the scope, the loop
+drops any retriever that does not implement `core.Filterable` and says so in the
+trace. A filter that leaves no usable tier is an error, not an empty answer.
+
+That is the deliberate cost: filtering a question the hierarchical tier would
+have answered gives you a narrower search, not a wider one that quietly ignores
+you. Archival memory is filtered on the same rule, which means a filter naming a
+document field excludes every takeaway — a query scoped to part of the corpus
+should not be answered from a conclusion drawn somewhere else.
+
+### Stopping one document from eating the evidence budget
+
+Evidence was deduplicated by citation identity, which catches nothing but
+literally the same chunk. Measured on the real 70-chunk index, "who is staffed
+on the project?" returned this:
+
+```
+[semantic:config/translations/README.md#0]
+[semantic:CLAUDE.md#0]
+[semantic:CLAUDE.md#1]
+[semantic:CLAUDE.md#6]
+```
+
+Three of four slots to one document, and `#0`/`#1` are adjacent — so they share
+the default 100-token chunk overlap verbatim. The budget bought one file said
+three ways. It compounds across tiers: a passage can arrive as a semantic chunk
+and again inside a hierarchical summary built from it, under two citations that
+look like two sources and are not.
+
+`--diverse` drops evidence that restates evidence already held (Jaccard over
+content tokens, stopwords excluded, 0.6 by default). `--per-doc N` caps how many
+items one document may contribute — the blunter instrument, and the effective
+one on the case above:
+
+```
+$ dispatch ask --per-doc 2 --trace "who is staffed on the project?"
+ 4 diverse  3 evidence item(s) kept — dropped 1: [semantic:CLAUDE.md#6] (doc cap)
+```
+
+Suppression runs over the whole set each round, not just new arrivals, and runs
+before the budget is applied — so a dropped duplicate frees its slot for
+something distinct rather than having already spent it. **Off by default**: it
+discards retrieved evidence, and doing that silently to someone who did not ask
+is the wrong default.
+
+### Citations are checked before you see the answer
+
+Every `[tier:source]` marker in a generated answer is resolved against the
+evidence that was actually retrieved. A marker that resolves to nothing is a
+fabricated source, and it looks exactly like a real one — which is why this runs
+on every answer rather than only in the eval, and why the warning goes to stderr
+whether or not you asked for `--trace`:
+
+```
+$ dispatch ask "what is the budget?"
+The budget is 4M [semantic:atlas-charter.md#1] with a reserve [semantic:invented.md#9].
+
+WARNING: 1 citation(s) resolve to no retrieved evidence: [semantic:invented.md#9]
+```
+
+`Answer.Citations` carries the same report to a library caller — `Resolved`,
+`Unresolved`, and `Uncited` (evidence the answer never used, which is normal,
+since evidence is over-fetched on purpose). `Loop.CitationPolicy` chooses what
+happens: `CiteReport` (default, tell the caller and change nothing),
+`CiteStrip` (remove the bad markers, still reporting them), or `CiteError`
+(fail the answer). The default does not rewrite the model's text, because
+silently editing an answer is its own kind of dishonesty.
+
+The check costs no LLM call — the answer and the evidence are both already in
+hand — and `agent.ExtractCitations` is the single implementation the eval uses
+too. Two copies would drift, and the copy that drifts is the one that stops
+catching fabrications.
+
+### Streaming, budgets and cost
+
+```bash
+dispatch ask --stream --timeout 90s --max-calls 4 --trace "what is the budget?"
+```
+
+`--stream` prints the answer as the model produces it. `llm.Streamer` is a
+separate optional interface, so a model that cannot stream falls back to a
+single call and every other implementation stays as small as it was. Only
+generation streams — the judge emits JSON nobody wants to watch assemble.
+
+`--timeout` bounds the whole question. Nothing did before: the HTTP client has a
+per-request timeout and one question makes many requests, so a hung endpoint
+hung the command forever. A deadline that expires mid-retrieval is reported as a
+deadline — `fanOut` records a tier's failure and carries on, which is right for
+one tier and wrong for a dead endpoint, where it would have surfaced as "no
+evidence retrieved" and blamed the corpus.
+
+`--max-calls` caps LLM calls per question, which is the unit that is billed;
+`--max-steps` bounds rounds, which is not the same thing once an expander adds a
+call per round and write-back adds one at the end. Reaching the cap is not an
+error — the loop answers from what it has — and generation is always reserved,
+so the budget can never run out at the one moment where everything has been paid
+for and nothing produced.
+
+`--trace` now reports tokens, read from the server's own `usage` block rather
+than estimated. A server that omits it says so instead of printing a zero that
+reads as free:
+
+```
+rounds: 1, llm calls: 2
+tokens: 1509 prompt + 64 completion = 1573 over 2 call(s)
+```
 
 Pointing `--corpus` at a repository skips `node_modules`, `.git`, `dist`,
 `vendor`, `build` and similar by default; `--exclude` adds more. Without this a
@@ -230,13 +392,19 @@ that resolve to nothing.
 
 - **core** — domain types + the single `Retriever` interface every tier satisfies
 - **llm** — OpenAI-compatible client over `net/http`, behind an interface so
-  everything above it tests offline
-- **index** — contextual chunking + hybrid store (cosine + BM25 fused by RRF)
+  everything above it tests offline; optional SSE streaming (`stream.go`) and
+  token accounting from the server's own `usage` block
+- **index** — contextual chunking + hybrid store (cosine + BM25 fused by RRF),
+  the content-addressed cache, and `index.Searcher`, the seam a backend swaps at
+- **index/pgvector** — the same tiers over Postgres + pgvector, via
+  `database/sql` and no dependency
 - **tiers/** — the four retrievers, plus the entity graph the relational tier
   traverses (`graph.go` builds and canonicalizes it, `coref.go` adjudicates
   which names denote one thing)
 - **router** — LLM classification with a keyword-heuristic fallback
-- **agent** — the loop (`loop.go`), write-back memory (`memory.go`), trace
+- **agent** — the loop (`loop.go`), write-back memory (`memory.go`), trace,
+  citation verification (`cite.go`), evidence diversity (`diversity.go`),
+  query expansion (`expand.go`)
 - **internal/fake** — scripted LLM + deterministic embedder, so `go test ./...`
   runs offline and free
 
@@ -473,11 +641,41 @@ Measured, not guessed:
   than being rare — which is the difference between a fix and a lucky run. The
   error and its diagnostic message stay, because a hosted reasoning model can
   still hit it.
-- **Vague queries retrieve noise.** "What is this project and what is it for?"
-  has no distinctive content words, so both BM25 and the embedding latch onto
-  incidental matches — the top hit was a translations how-to that merely says
-  "in the project". Contextual chunking helps but does not rescue a query with
-  nothing to match on.
+- **Vague queries retrieve noise, and HyDE did not fix it. Measured.**
+  "What is this project and what is it for?" has no distinctive content words,
+  so both BM25 and the embedding latch onto incidental matches — the top hit was
+  a translations how-to that merely says "in the project". Contextual chunking
+  helps but does not rescue a query with nothing to match on.
+
+  Query expansion is the standard answer: write a hypothetical answer passage
+  and embed *that*, on the theory that a real answer resembles a fake answer far
+  more than it resembles a question. `agent.HyDE` implements it and `--hyde`
+  turns it on. The measurement:
+
+  | Corpus | Expansion | recall@1 | recall@5 | Time |
+  |---|---|---|---|---|
+  | bundled, 18 chunks | none | 50% | 94% | — |
+  | bundled, 18 chunks | HyDE | 56% | 94% | — |
+  | real, 70 chunks | none | **54%** | **100%** | **7.8s** |
+  | real, 70 chunks | HyDE | 54% | 98% | 2m44s |
+
+  On the corpus that matters it changed recall@1 not at all, cost a point of
+  recall@5, and took **21x the wall-clock**. The bundled corpus moved by one
+  chunk out of eighteen, which is noise and should not be read as a gain.
+
+  And on the query that motivated it, the failure is unchanged: the translations
+  how-to is still the top hit. The hypothetical explains why — asked what this
+  project is, `llama3.2:3b` confidently invented an unrelated "EcoCycle"
+  initiative. A vague query gives the expander nothing to ground on either, so
+  it invents a subject and retrieves confidently about the wrong one.
+
+  So: **off by default**, like the LLM reranker, for the same reason. It is kept
+  because the implementation is sound and a stronger expander model or a corpus
+  with more distinctive vocabulary might change the result — measure it before
+  believing it. Two mitigations are built in: the question stays in the embedded
+  text so a bad hypothetical degrades the query rather than replacing it, and
+  the expansion reaches only the dense half, since BM25 would treat every
+  invented noun as a high-idf term (`core.Query.Embedding` explains that).
 - **Ingest is slow on a local thinking model.** Measured on `gemma4:e4b` over
   70 chunks of ~300 tokens:
 
@@ -486,16 +684,17 @@ Measured, not guessed:
   | contextual chunking | ~13s/chunk | ~15 min | yes |
   | graph extraction | ~42s/chunk (p90 65s) | ~40 min | yes |
   | coreference adjudication | ~46s/candidate (3 votes) | ~18 min | yes |
-  | RAPTOR tree | ~30s/summary | ~10 min | **no** |
+  | RAPTOR tree | ~30s/summary | ~10 min | yes |
 
   Coreference scales with candidate count, not chunk count — 22 candidates for
   70 chunks — so it grows far more slowly than the rest.
 
-  Chunking and extraction are cached by content hash, so re-ingest is free — a
-  second run over unchanged documents reported 70 cache hits and 0 calls. The
-  tree is not cached and pays again on every `--hierarchy`.
-  `index.Config.ContextLLM` accepts a separate cheaper model for the chunking
-  pass, which is the biggest single lever; the CLI does not expose it yet.
+  Every stage is now cached by content hash, including the two that were not:
+  chunk embeddings and the RAPTOR summaries' embeddings. A re-ingest over
+  unchanged documents is skipped outright at the document level and makes no
+  calls of any kind. The lever that remains is the utility model —
+  `--utility-model`, or `LLM_UTILITY_MODEL`, or `index.Config.ContextLLM` from
+  the library — which is worth ~11x on the passes that dominate a first ingest.
 - **`isReadOnly` is defense in depth, not the primary guard.** Grant the
   executing database role SELECT only. A generated-SQL allowlist is string
   matching against an adversary who controls the model's input.
@@ -504,8 +703,8 @@ Measured, not guessed:
   driver. Anything outside the subset is a clear error, never a wrong answer.
   Production implements `SQLRunner` over `database/sql`.
 - **Reranking with a general chat model makes retrieval worse. Tested twice.**
-  `index.Reranker` exists, `--rerank` enables it, the tests pass — and it is off
-  by default because every measurement says it should be:
+  `index.Reranker` exists, `--rerank-llm` enables it, the tests pass — and it is
+  off by default because every measurement says it should be:
 
   | Reranker | recall@1 | recall@5 | Time |
   |---|---|---|---|
@@ -528,8 +727,33 @@ Measured, not guessed:
   unscored candidates and falls back to retrieval order on failure. The
   literature this came from (Anthropic's 49% → 67%) assumes a purpose-built
   cross-encoder — Cohere Rerank, `bge-reranker`, Voyage — trained for exactly
-  this ordering task. `index.Reranker` is a one-method interface so one can be
-  dropped in. Until then, off.
+  this ordering task.
+
+  **`index.CrossEncoder` is now that path**, and `--rerank` means it:
+
+  ```bash
+  export RERANK_BASE_URL=http://localhost:8080   # or https://api.cohere.com/v2
+  export RERANK_API_KEY=...                      # omit for a local server
+  export RERANK_MODEL=bge-reranker-v2-m3         # optional
+
+  dispatch eval retrieval -k 5              # baseline
+  dispatch eval retrieval -k 5 --rerank     # with the cross-encoder
+  ```
+
+  It speaks the Cohere/Jina `/rerank` shape and the bare-array shape
+  text-embeddings-inference returns, over `net/http` — no new dependency. Unlike
+  the LLM reranker it returns errors rather than degrading to retrieval order,
+  because a misconfigured endpoint that silently passed the input through would
+  be indistinguishable from a reranker that simply never helps, which is the one
+  thing the measurement has to be able to tell apart.
+
+  **It is still off by default, and there is no number for it here.** No
+  cross-encoder was run against these corpora, so the honest claim is that the
+  mechanism the LLM reranker failed at now has an implementation with a reason
+  to work, not that it does. Hold it to the same standard: two commands above,
+  and if it does not beat RRF on your corpus, leave it off. Given recall@1 sits
+  at 54%, this is the most likely single lever — and the reason to measure it
+  rather than assume it.
 - **Concurrency is bounded by the server, and then by memory.** The eval loops
   run `--jobs` items at once (default 4), but Ollama defaults to
   `OLLAMA_NUM_PARALLEL=1` and serves one request at a time, so client
@@ -558,8 +782,27 @@ Measured, not guessed:
 
   The larger levers remain a smaller answering model or a hosted endpoint.
 - **Both eval corpora are still small** — 18 and 70 chunks. 70 is enough to make
-  ranking matter; it is not enough to say anything about behaviour at 10,000,
-  where a flat cosine scan and an in-memory graph both stop being reasonable.
+  ranking matter; it is not enough to say anything about *retrieval quality* at
+  10,000. What the flat index costs at that size is now measured rather than
+  asserted (`dispatch eval scale`, 768 dimensions, this machine):
+
+  | chunks | ingest | search p50 | search p90 | resident | per chunk |
+  |---|---|---|---|---|---|
+  | 100 | 2ms | 233µs | 244µs | 931 KB | 9.3 KB |
+  | 1,000 | 23ms | 1.06ms | 1.21ms | 8.8 MB | 9.0 KB |
+  | 10,000 | 677ms | 9.78ms | 10.4ms | 86.6 MB | 8.9 KB |
+  | 50,000 | 15.6s | 54.3ms | 55.0ms | 431 MB | 8.8 KB |
+
+  Cleanly linear in both, which is what a full scan of every vector plus every
+  BM25 posting predicts. Read it as: a few thousand chunks is comfortable,
+  10,000 costs 10ms and 87 MB per process, and 50,000 is where a 54ms floor per
+  query and 431 MB resident stop being reasonable.
+
+  **That eval measures the index structure and nothing else.** It uses synthetic
+  documents and a deterministic local embedder, so it needs no API key and costs
+  nothing — and reports no recall number, because recall over synthetic text
+  measures the generator. Quality at scale still needs a real corpus.
+  The in-memory entity graph has the same problem and no equivalent measurement.
 - **The loop rarely refines on these corpora.** Almost every case answers in
   `rounds 1`, because `-k` across several tiers already surfaces enough. That is
   the corpora being small rather than the judge being lenient — refinement is
@@ -568,11 +811,65 @@ Measured, not guessed:
 
 ## Swapping in production backends
 
-The reference `index.Store` is in-memory. Keep the `Ingest` contextual-chunking
-logic and replace the store with **pgvector** or **DuckDB**. Keep the `Retriever`
-interface and everything upstream is unchanged.
+The reference `index.Store` is in-memory, and the table above says roughly where
+that stops working. `index/pgvector` is the replacement, over `database/sql`:
 
-`tiers.SQLRunner` is an interface — back it with `database/sql`.
+```go
+import _ "github.com/jackc/pgx/v5/stdlib"   // you bring the driver
+
+db, _ := sql.Open("pgx", os.Getenv("DATABASE_URL"))
+store, _ := pgvector.New(pgvector.Config{DB: db, LLM: client, Dims: 768})
+store.Migrate(ctx)                          // table + HNSW + GIN indexes
+
+loop.Retrievers[core.TierSemantic] = tiers.NewSemantic(store)
+```
+
+**dispatch stays dependency-free because the driver is yours.** The package
+imports only `database/sql`; nothing enters `go.mod`.
+
+The split is deliberate. `index.Store` keeps chunking, contextual chunking, the
+caches and the ingest planner; `pgvector.Store` owns storage and search. That is
+why its `Upsert` takes chunks and vectors rather than documents — one
+contextual-chunking pass feeds either backend. It runs the same hybrid (cosine
+pool + Postgres full-text pool) and fuses with the **same exported
+`index.FuseRankings`** as the in-memory path, because ranking is the one place
+where two backends drifting apart would be invisible in the results.
+
+The seam is `index.Searcher` (`Search`, `Len`), which `tiers.NewSemantic` takes;
+everything above it is unchanged. Metadata filters translate to `meta ->> $n`
+over a JSONB column with values bound, never interpolated, and LIKE
+metacharacters escaped so a filter value cannot widen its own prefix match.
+
+**It has not been run against a live Postgres.** The tests are hermetic — a
+stdlib `database/sql` fake driver covers query construction, parameter binding,
+scan order and error paths, and asserts that the fused ranking survives
+Postgres returning rows in its own order. What they cannot check is that a real
+server accepts the SQL. Treat the first `Migrate` and query against your own
+database as the actual verification.
+
+`tiers.SQLRunner` is an interface — back it with `database/sql` the same way.
+
+## API changes
+
+Pre-1.0, and two signatures moved to carry filters and to let a backend swap in:
+
+| Before | Now |
+|---|---|
+| `store.Search(ctx, "text", k)` | `store.Search(ctx, core.Query{Text: "text", TopK: k})` |
+| `tiers.NewSemantic(*index.Store)` | `tiers.NewSemantic(index.Searcher)` — `*index.Store` still satisfies it |
+
+`core.Query` gained `Filter` and `Expanded`, `core.Retriever` gained an optional
+companion interface `core.Filterable`, `llm.LLM` gained an optional companion
+interface `llm.Streamer`, and `--rerank` now means the cross-encoder; the
+chat-model reranker moved to `--rerank-llm`. Saved indexes load unchanged: one
+written before this carries no document fingerprints, so the next ingest
+re-derives each document once and is incremental from then on.
+
+`agent.Answer` gained `Citations`, and `Loop` gained `CitationPolicy`,
+`Diversity`, `Expander`, `MaxCalls` and `OnDelta` — all zero-valued to the
+previous behaviour, except citation verification, which now always runs and
+populates `Answer.Citations` (it changes no text under the default policy).
+`extractCitations` moved from the eval to `agent.ExtractCitations`.
 
 ## Lineage
 

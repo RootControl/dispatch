@@ -8,17 +8,19 @@ Most RAG systems cannot answer a basic question about themselves: *how often is
 the top result the right one?* dispatch measures it, with no labelled data —
 it writes a question for each chunk and checks whether that chunk comes back.
 
-On its own corpora that number is **54%** at rank 1 and **~95%** in the top five.
+On its own corpora that number is **54%** at rank 1 and **~95%** in the top five
+— rising to **74%** at rank 1 with a cross-encoder reranker in front of it.
 Which is the point: retrieve at `-k 4` or `-k 5`, never `-k 1`, and now you know
-why rather than guessing. Run it against your own documents and you will get
-your own number in a couple of minutes.
+why rather than guessing — and you know what moves it. Run it against your own
+documents and you will get your own number in a couple of minutes.
 
 Four findings from doing that here, all reproducible from this repo:
 
-- **LLM reranking made retrieval worse. Twice.** recall@5 fell from 94% to 39%
-  with a 3B model and to 88% with a 7B one — at 13x the wall-clock. It stays
-  off by default; `--rerank` now means a purpose-built cross-encoder instead.
-  ([why](#known-limitations))
+- **Reranking depends entirely on the model class, not its size.** A 7B *chat*
+  model took recall@1 to 35% and a 3B one took recall@5 from 94% to 39%. A 0.3B
+  *cross-encoder* took recall@1 from 54% to **74%** — the largest single
+  improvement measured here. `--rerank` means the cross-encoder;
+  `--rerank-llm` is the path that fails. ([numbers](#known-limitations))
 - **HyDE query expansion did nothing, at 21x the cost.** The standard fix for
   vague queries left recall@1 at 54% on the real corpus, cost a point of
   recall@5, and turned 7.8s into 2m44s. Also off by default.
@@ -475,6 +477,12 @@ which is the useful signal: **the right chunk is the top hit about half the
 time, and in the top five almost always.** Run with `-k 4` or `-k 5`; `-k 1`
 would be wrong as often as right.
 
+That is the number *before reranking*, and it is the one worth quoting, because
+it describes what the retrieval stack does on its own. A cross-encoder in front
+of it takes the real corpus to 74% — see [reranking](#known-limitations), where
+the same table also shows two chat models taking it to 33% and 35%. Everything
+below in this section is measured without a reranker.
+
 recall@5 moves between 94% and 100% with the question set, so read it as "about
 95%" rather than any single figure. Inspecting the real corpus's three misses
 under `qwen2.5:7b` found that two were not retrieval failures at all: one chunk
@@ -732,9 +740,15 @@ Measured, not guessed:
   **`index.CrossEncoder` is now that path**, and `--rerank` means it:
 
   ```bash
-  export RERANK_BASE_URL=http://localhost:8080   # or https://api.cohere.com/v2
+  # A local cross-encoder. Any /rerank endpoint works — Cohere, Jina, Voyage,
+  # or text-embeddings-inference; this one is what the table below was measured
+  # against, and it runs on a laptop.
+  docker run -d --name rerank -p 7997:7997 michaelf34/infinity:latest \
+      v2 --model-id BAAI/bge-reranker-base --port 7997 --engine torch
+
+  export RERANK_BASE_URL=http://localhost:7997   # or https://api.cohere.com/v2
   export RERANK_API_KEY=...                      # omit for a local server
-  export RERANK_MODEL=bge-reranker-v2-m3         # optional
+  export RERANK_MODEL=BAAI/bge-reranker-base
 
   dispatch eval retrieval -k 5              # baseline
   dispatch eval retrieval -k 5 --rerank     # with the cross-encoder
@@ -747,13 +761,45 @@ Measured, not guessed:
   be indistinguishable from a reranker that simply never helps, which is the one
   thing the measurement has to be able to tell apart.
 
-  **It is still off by default, and there is no number for it here.** No
-  cross-encoder was run against these corpora, so the honest claim is that the
-  mechanism the LLM reranker failed at now has an implementation with a reason
-  to work, not that it does. Hold it to the same standard: two commands above,
-  and if it does not beat RRF on your corpus, leave it off. Given recall@1 sits
-  at 54%, this is the most likely single lever — and the reason to measure it
-  rather than assume it.
+  **And it works.** Measured with `BAAI/bge-reranker-base` served locally:
+
+  | Corpus | Reranker | recall@1 | recall@5 |
+  |---|---|---|---|
+  | bundled, 18 chunks | none | 50% | 94% |
+  | bundled, 18 chunks | `bge-reranker-base` | 56% | **100%** |
+  | real, 70 chunks | none | 54% | **100%** |
+  | real, 70 chunks | `bge-reranker-base` | **74%** | 97% |
+  | real, 70 chunks | `qwen2.5:7b` (chat) | 35% | 88% |
+  | real, 70 chunks | `llama3.2:3b` (chat) | 33% | 39% |
+
+  **+20 points of recall@1 on the real corpus** — 35/65 top hits to 48/65. That
+  is the largest single improvement measured anywhere in this project, and it
+  lands on exactly the number the rest of the README calls its weakest.
+
+  So the earlier finding was too broad. It is not that reranking does not work;
+  it is that **reranking with a chat model does not work**, and the distinction
+  is the model class rather than the model size. A 7B chat model took recall@1
+  to 35%. A 0.3B cross-encoder took it to 74%. The literature's assumption was
+  load-bearing all along.
+
+  The cost is two points of recall@5, 100% to 97%, and both losses are
+  explainable rather than mysterious: `README.zh.md#0` is a Chinese document and
+  `bge-reranker-base` is English-trained — use `bge-reranker-v2-m3` on a
+  multilingual corpus — and `AGENTS.md#0` was probed with "Who is Claude?", a
+  query with nothing distinctive to match, which is the same class of failure
+  HyDE could not fix either. A reranker reorders a 20-candidate pool down to 5,
+  so it can evict as well as promote; at `-k 5` that trade bought thirteen
+  first-place hits for two top-five ones.
+
+  **Still off by default**, because it needs an endpoint that is not part of
+  this repo — not because the evidence is against it. If you have somewhere to
+  run a cross-encoder, the measurement above says turn it on, and the two
+  commands above say so for your corpus rather than this one.
+
+  *No honest latency figure here.* The run took 10m27s against 7.8s, but under
+  x86 emulation on an arm64 host, which is not a number anyone should plan
+  with. Reranking 20 passages per query is real work and is not free; measure it
+  natively before believing any speed claim in either direction.
 - **Concurrency is bounded by the server, and then by memory.** The eval loops
   run `--jobs` items at once (default 4), but Ollama defaults to
   `OLLAMA_NUM_PARALLEL=1` and serves one request at a time, so client

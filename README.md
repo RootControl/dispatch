@@ -840,12 +840,60 @@ everything above it is unchanged. Metadata filters translate to `meta ->> $n`
 over a JSONB column with values bound, never interpolated, and LIKE
 metacharacters escaped so a filter value cannot widen its own prefix match.
 
-**It has not been run against a live Postgres.** The tests are hermetic — a
-stdlib `database/sql` fake driver covers query construction, parameter binding,
-scan order and error paths, and asserts that the fused ranking survives
-Postgres returning rows in its own order. What they cannot check is that a real
-server accepts the SQL. Treat the first `Migrate` and query against your own
-database as the actual verification.
+### Verifying it against a real Postgres
+
+Two test suites, because they check different things. The unit tests are
+hermetic — a stdlib `database/sql` fake driver covers query construction,
+parameter binding, scan order and error paths — but cannot check that a real
+server accepts any of it. [`index/pgvector/integration`](index/pgvector/integration)
+does, and is **a separate module so the pgx driver never enters dispatch's
+`go.mod`**; the parent's `./...` skips any directory holding its own `go.mod`,
+so `go test ./...` at the repo root stays hermetic and dependency-free.
+
+```bash
+docker run -d --name pgtest -e POSTGRES_PASSWORD=dispatch \
+    -e POSTGRES_DB=dispatch -p 55432:5432 pgvector/pgvector:pg17
+
+cd index/pgvector/integration
+DISPATCH_PG_DSN='postgres://postgres:dispatch@localhost:55432/dispatch?sslmode=disable' \
+    go test -v ./...
+```
+
+12 tests, run against PostgreSQL 17.10 + pgvector: migration accepted and
+repeatable, upsert/search round-tripping every column, both halves of the
+hybrid, filters (including LIKE-metacharacter escaping), delete, and the
+semantic tier over Postgres with and without a filter. Without `DISPATCH_PG_DSN`
+they skip.
+
+The DDL builds what it claims, and the planner uses it:
+
+```
+"inspect_me_embedding_idx" hnsw (embedding vector_cosine_ops)
+"inspect_me_fts_idx"       gin (to_tsvector('english'::regconfig, embedded))
+"inspect_me_meta_idx"      gin (meta)
+
+->  Index Scan using inspect_me_embedding_idx   -- ORDER BY embedding <=> $1
+->  Bitmap Index Scan on inspect_me_fts_idx     -- to_tsvector @@ plainto_tsquery
+```
+
+**The suite was checked against negative controls before its passes were
+believed**, the same standard the answer eval is held to. Six deliberate breaks
+— unescaped LIKE wildcards, rows returned in scan order instead of fused order,
+full-text indexing the body without its context sentence, the lexical half
+returning nothing, filters never reaching the SQL, delete as a no-op — each
+fail the test that covers them.
+
+That mattered: **the two lexical-half tests originally passed while the
+full-text column was deliberately broken**, and took three attempts to isolate.
+Searching for a term in the text proved nothing because the vector contained
+that term too; giving the target a body-only vector proved nothing because it
+was the only row in the table; giving every row one identical vector proved
+nothing because Postgres returns tied rows in reverse insertion order, handing
+the last-inserted target the top slot for free. The version that works points
+the dense half *the wrong way* — fillers at cosine distance 0 from the query,
+the target orthogonal — so a target that still ranks first can only have been
+lifted lexically. A check that cannot fail looks exactly like a check that
+passes.
 
 `tiers.SQLRunner` is an interface — back it with `database/sql` the same way.
 

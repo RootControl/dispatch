@@ -51,19 +51,34 @@ type CrossEncoder struct {
 var _ Reranker = (*CrossEncoder)(nil)
 
 // NewCrossEncoderFromEnv builds a CrossEncoder from RERANK_BASE_URL,
-// RERANK_API_KEY and RERANK_MODEL. It returns an error when no base URL is
-// configured, so a caller asking for reranking is told the endpoint is missing
-// rather than quietly getting none.
+// RERANK_API_KEY, RERANK_MODEL and RERANK_TIMEOUT. It returns an error when no
+// base URL is configured, so a caller asking for reranking is told the endpoint
+// is missing rather than quietly getting none.
 func NewCrossEncoderFromEnv() (*CrossEncoder, error) {
 	base := strings.TrimRight(os.Getenv("RERANK_BASE_URL"), "/")
 	if base == "" {
 		return nil, errors.New("index: no reranker endpoint (set RERANK_BASE_URL)")
 	}
-	return &CrossEncoder{
+	ce := &CrossEncoder{
 		BaseURL: base,
 		APIKey:  os.Getenv("RERANK_API_KEY"),
 		Model:   os.Getenv("RERANK_MODEL"),
-	}, nil
+	}
+	// RERANK_TIMEOUT exists because the default is genuinely too tight for some
+	// real configurations: scoring 20 passages with a 568M cross-encoder on CPU
+	// ran past 60 seconds, and the failure surfaces as a bare "context deadline
+	// exceeded" that reads like a broken endpoint rather than a slow one.
+	if v := os.Getenv("RERANK_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("index: RERANK_TIMEOUT %q: %w (want a duration like 300s or 5m)", v, err)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("index: RERANK_TIMEOUT %q must be positive", v)
+		}
+		ce.HTTPClient = &http.Client{Timeout: d}
+	}
+	return ce, nil
 }
 
 // rerankResult covers the response shapes the common servers return. Cohere and

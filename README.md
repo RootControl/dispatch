@@ -16,11 +16,12 @@ documents and you will get your own number in a couple of minutes.
 
 Four findings from doing that here, all reproducible from this repo:
 
-- **Reranking depends entirely on the model class, not its size.** A 7B *chat*
-  model took recall@1 to 35% and a 3B one took recall@5 from 94% to 39%. A 0.3B
-  *cross-encoder* took recall@1 from 54% to **74%** — the largest single
-  improvement measured here. `--rerank` means the cross-encoder;
-  `--rerank-llm` is the path that fails. ([numbers](#known-limitations))
+- **Reranking depends on the model class, and then not on its size.** A 7B
+  *chat* model took recall@1 to 35%. A 278M *cross-encoder* took it from 54% to
+  **74%** — the largest single improvement measured here. Doubling that
+  cross-encoder to 568M then made it *worse* (69%). `--rerank` means the
+  cross-encoder; `--rerank-llm` is the path that fails.
+  ([numbers](#known-limitations))
 - **HyDE query expansion did nothing, at 21x the cost.** The standard fix for
   vague queries left recall@1 at 54% on the real corpus, cost a point of
   recall@5, and turned 7.8s into 2m44s. Also off by default.
@@ -749,10 +750,16 @@ Measured, not guessed:
   export RERANK_BASE_URL=http://localhost:7997   # or https://api.cohere.com/v2
   export RERANK_API_KEY=...                      # omit for a local server
   export RERANK_MODEL=BAAI/bge-reranker-base
+  export RERANK_TIMEOUT=5m                       # optional; default 60s
 
   dispatch eval retrieval -k 5              # baseline
   dispatch eval retrieval -k 5 --rerank     # with the cross-encoder
   ```
+
+  `RERANK_TIMEOUT` exists because the 60s default is genuinely too tight for
+  some real configurations: `bge-reranker-v2-m3` scoring 20 passages on an
+  emulated CPU ran past it, and the failure surfaces as a bare "context deadline
+  exceeded" that reads like a broken endpoint rather than a slow one.
 
   It speaks the Cohere/Jina `/rerank` shape and the bare-array shape
   text-embeddings-inference returns, over `net/http` — no new dependency. Unlike
@@ -761,16 +768,18 @@ Measured, not guessed:
   be indistinguishable from a reranker that simply never helps, which is the one
   thing the measurement has to be able to tell apart.
 
-  **And it works.** Measured with `BAAI/bge-reranker-base` served locally:
+  **And it works.** Two cross-encoders, measured against both corpora:
 
-  | Corpus | Reranker | recall@1 | recall@5 |
-  |---|---|---|---|
-  | bundled, 18 chunks | none | 50% | 94% |
-  | bundled, 18 chunks | `bge-reranker-base` | 56% | **100%** |
-  | real, 70 chunks | none | 54% | **100%** |
-  | real, 70 chunks | `bge-reranker-base` | **74%** | 97% |
-  | real, 70 chunks | `qwen2.5:7b` (chat) | 35% | 88% |
-  | real, 70 chunks | `llama3.2:3b` (chat) | 33% | 39% |
+  | Corpus | Reranker | Params | recall@1 | recall@5 |
+  |---|---|---|---|---|
+  | bundled, 18 chunks | none | — | 50% | 94% |
+  | bundled, 18 chunks | `bge-reranker-base` | 278M | 56% | **100%** |
+  | bundled, 18 chunks | `bge-reranker-v2-m3` | 568M | 56% | **100%** |
+  | real, 70 chunks | none | — | 54% | **100%** |
+  | real, 70 chunks | `bge-reranker-base` | 278M | **74%** | 97% |
+  | real, 70 chunks | `bge-reranker-v2-m3` | 568M | 69% | 98% |
+  | real, 70 chunks | `qwen2.5:7b` (chat) | 7B | 35% | 88% |
+  | real, 70 chunks | `llama3.2:3b` (chat) | 3B | 33% | 39% |
 
   **+20 points of recall@1 on the real corpus** — 35/65 top hits to 48/65. That
   is the largest single improvement measured anywhere in this project, and it
@@ -779,27 +788,43 @@ Measured, not guessed:
   So the earlier finding was too broad. It is not that reranking does not work;
   it is that **reranking with a chat model does not work**, and the distinction
   is the model class rather than the model size. A 7B chat model took recall@1
-  to 35%. A 0.3B cross-encoder took it to 74%. The literature's assumption was
+  to 35%. A 278M cross-encoder took it to 74%. The literature's assumption was
   load-bearing all along.
 
-  The cost is two points of recall@5, 100% to 97%, and both losses are
-  explainable rather than mysterious: `README.zh.md#0` is a Chinese document and
-  `bge-reranker-base` is English-trained — use `bge-reranker-v2-m3` on a
-  multilingual corpus — and `AGENTS.md#0` was probed with "Who is Claude?", a
+  Within the right model class, though, size is not the lever either — and the
+  two rerankers make that concrete. `bge-reranker-base` lost two chunks from the
+  top five. Both were explainable, and one carried a prediction:
+  `README.zh.md#0` is a Chinese document against an English-trained reranker, so
+  the multilingual `bge-reranker-v2-m3` should recover it.
+
+  **It does — and costs more than it recovers.** v2-m3 has twice the parameters,
+  fixes exactly the miss predicted, takes recall@5 to 98%, and gives up three
+  first-place hits to do it: 74% → 69% at rank 1. The corpus is overwhelmingly
+  English, so the multilingual model spends capacity on a problem it barely has
+  and is worse at the one it does. Use v2-m3 when you actually have
+  mixed-language documents, not because it is the bigger model.
+
+  The other miss survives both: `AGENTS.md#0`, probed with "Who is Claude?" — a
   query with nothing distinctive to match, which is the same class of failure
-  HyDE could not fix either. A reranker reorders a 20-candidate pool down to 5,
-  so it can evict as well as promote; at `-k 5` that trade bought thirteen
-  first-place hits for two top-five ones.
+  HyDE could not fix either. No reranker rescues a query that under-specifies
+  what it wants.
+
+  A reranker reorders a 20-candidate pool down to 5, so it can evict as well as
+  promote. At `-k 5` `bge-reranker-base` traded two top-five hits for thirteen
+  first-place ones, which is the trade worth making when the answer reads
+  `-k 4`-worth of evidence anyway.
 
   **Still off by default**, because it needs an endpoint that is not part of
   this repo — not because the evidence is against it. If you have somewhere to
   run a cross-encoder, the measurement above says turn it on, and the two
   commands above say so for your corpus rather than this one.
 
-  *No honest latency figure here.* The run took 10m27s against 7.8s, but under
-  x86 emulation on an arm64 host, which is not a number anyone should plan
-  with. Reranking 20 passages per query is real work and is not free; measure it
-  natively before believing any speed claim in either direction.
+  *No latency figures here, deliberately.* Both runs were under x86 emulation on
+  an arm64 host, which is not a number anyone should plan with — and v2-m3
+  additionally needed `--batch-size 2` to stop the server being OOM-killed, and
+  `RERANK_TIMEOUT` above the 60s default. Reranking 20 passages per query is
+  real work; measure it natively before believing any speed claim in either
+  direction.
 - **Concurrency is bounded by the server, and then by memory.** The eval loops
   run `--jobs` items at once (default 4), but Ollama defaults to
   `OLLAMA_NUM_PARALLEL=1` and serves one request at a time, so client

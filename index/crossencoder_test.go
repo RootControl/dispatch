@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RootControl/dispatch/core"
 )
@@ -194,5 +195,37 @@ func TestStoreUsesCrossEncoder(t *testing.T) {
 	docs, _ := (*req)["documents"].([]any)
 	if len(docs) <= 1 {
 		t.Errorf("reranker was sent %d passages for topK=1; Search did not over-fetch", len(docs))
+	}
+}
+
+// RERANK_TIMEOUT exists because the 60s default is genuinely too tight for
+// some real configurations: scoring 20 passages with a 568M cross-encoder on
+// CPU ran past it, and the failure reads like a broken endpoint rather than a
+// slow one.
+func TestCrossEncoderTimeoutFromEnv(t *testing.T) {
+	t.Setenv("RERANK_BASE_URL", "http://example.test")
+
+	t.Setenv("RERANK_TIMEOUT", "")
+	ce, err := NewCrossEncoderFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ce.HTTPClient != nil {
+		t.Error("unset RERANK_TIMEOUT should leave the default client in place")
+	}
+
+	t.Setenv("RERANK_TIMEOUT", "5m")
+	if ce, err = NewCrossEncoderFromEnv(); err != nil {
+		t.Fatal(err)
+	}
+	if ce.HTTPClient == nil || ce.HTTPClient.Timeout != 5*time.Minute {
+		t.Errorf("HTTPClient = %+v, want a 5m timeout", ce.HTTPClient)
+	}
+
+	for _, bad := range []string{"soon", "5", "-30s", "0"} {
+		t.Setenv("RERANK_TIMEOUT", bad)
+		if _, err := NewCrossEncoderFromEnv(); err == nil {
+			t.Errorf("RERANK_TIMEOUT=%q was accepted", bad)
+		}
 	}
 }

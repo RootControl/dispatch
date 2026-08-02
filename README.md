@@ -809,6 +809,23 @@ Measured, not guessed:
   HyDE could not fix either. No reranker rescues a query that under-specifies
   what it wants.
 
+  **`bge-reranker-v2-gemma` was attempted and has no row above, deliberately.**
+  It is a third architecture again — 2.5B parameters, an LLM prompted to answer
+  "Yes" or "No" and scored on the logit of the "Yes" token, rather than a
+  cross-encoder emitting a relevance score. Two things are worth recording. It
+  is not interchangeable at the serving layer: `infinity` inspects the Gemma
+  causal-LM config, decides the model cannot rerank, and exposes only `embed`,
+  so reaching it at all meant reimplementing BAAI's scoring behind a `/rerank`
+  endpoint. And it is not interchangeable in cost: **~13 seconds per passage**
+  against `bge-reranker-base`'s ~0.16s, roughly 80x, which at a 20-candidate
+  pool is about four minutes per query. In 5.9 GB of an emulated 7.75 GB
+  container it then degraded — one query took 55 minutes — and the run was
+  abandoned at 12 of 18. It ranks correctly on a spot check (+10.0 for the
+  relevant passage against −7.1 for an irrelevant one); there is simply no
+  recall figure, and quoting one from a partial run would be worse than
+  quoting none. On a GPU this is a different proposition; on CPU it is not a
+  candidate.
+
   A reranker reorders a 20-candidate pool down to 5, so it can evict as well as
   promote. At `-k 5` `bge-reranker-base` traded two top-five hits for thirteen
   first-place ones, which is the trade worth making when the answer reads

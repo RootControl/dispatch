@@ -2,6 +2,7 @@ package index
 
 import (
 	"math"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -18,8 +19,27 @@ func TestFuseRRF(t *testing.T) {
 		t.Fatalf("top score = %v, want %v", got[0].score, wantX)
 	}
 	if got[0].id != "x" || got[1].id != "y" || got[2].id != "z" {
-		t.Fatalf("order = %v, want [x y z]", ids(got))
+		t.Fatalf("order = %v, want [x y z]", fusedIDs(got))
 	}
+
+	// Provenance rides along with the score, which is what tells a reader why a
+	// chunk is here. x and y placed in both lists at different positions; z
+	// only in the first, so its second slot is 0 — "that list did not return
+	// it", which is exactly the distinction the fused score cannot express.
+	want := map[string][]int{"x": {1, 2}, "y": {2, 1}, "z": {3, 0}}
+	for _, f := range got {
+		if !slices.Equal(f.ranks, want[f.id]) {
+			t.Errorf("%s ranks = %v, want %v", f.id, f.ranks, want[f.id])
+		}
+	}
+}
+
+func fusedIDs(f []fused) []string {
+	out := make([]string, len(f))
+	for i, x := range f {
+		out[i] = x.id
+	}
+	return out
 }
 
 func TestBM25RanksExactTermMatch(t *testing.T) {
@@ -28,7 +48,7 @@ func TestBM25RanksExactTermMatch(t *testing.T) {
 	bm.add("d1", "invoice 4471 total amount due")
 	bm.add("d2", "weather notes and parking logistics")
 
-	got := bm.search("invoice 4471", 0)
+	got := bm.search("invoice 4471", 0, nil)
 	if len(got) == 0 || got[0].id != "d1" {
 		t.Fatalf("expected d1 first for exact term match, got %v", ids(got))
 	}
@@ -41,8 +61,8 @@ func TestBM25RareTermScoresHigher(t *testing.T) {
 	bm.add("d1", "quarterly report summary")
 	bm.add("d2", "monthly report invoice 4471")
 
-	rare := bm.search("4471", 0)
-	common := bm.search("report", 0)
+	rare := bm.search("4471", 0, nil)
+	common := bm.search("report", 0, nil)
 	if len(rare) == 0 || len(common) == 0 {
 		t.Fatal("expected matches for both queries")
 	}

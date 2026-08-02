@@ -137,7 +137,7 @@ func TestSearchOverFetchesForReranker(t *testing.T) {
 	if _, err := s.Ingest(context.Background(), docs); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Search(context.Background(), "budget", 3)
+	got, err := s.Search(context.Background(), core.Query{Text: "budget", TopK: 3})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -22,6 +22,19 @@ type ChunkOptions struct {
 	// FAQ answers — would lose them with no error and no way to notice. Opt in
 	// with `ingest --min-words`, which reports how many chunks it dropped.
 	MinWords int
+	// Headings splits on markdown headings before paragraphs, so a chunk never
+	// spans two sections, and prefixes each chunk with its heading path.
+	//
+	// The prefix is the point. "Atlas > Budget > Contingency" in front of a
+	// chunk gives the embedder and BM25 the same kind of situating signal that
+	// contextual chunking pays an LLM call per chunk to write — except this one
+	// is free, exact, and already in the document. It composes with contextual
+	// chunking rather than replacing it.
+	//
+	// Off by default: it changes chunk boundaries and therefore every vector,
+	// so turning it on is a re-ingest. Documents with no headings are unaffected
+	// either way.
+	Headings bool
 }
 
 func (o ChunkOptions) withDefaults() ChunkOptions {
@@ -75,15 +88,54 @@ var (
 // carrying OverlapTokens of trailing context into each subsequent chunk.
 func Split(text string, opts ChunkOptions) []string {
 	opts = opts.withDefaults()
-	units := segmentize(text, opts.TargetTokens)
+	if opts.Headings && HasHeadings(text) {
+		return splitSections(text, opts)
+	}
+	return splitFlat(text, opts, "")
+}
+
+// splitSections chunks each heading-delimited section independently, so a chunk
+// never spans a section boundary, and prefixes each with its heading path.
+//
+// Sections are not packed together even when two small ones would fit in one
+// chunk. That would put two unrelated topics behind one embedding and one
+// citation, which is the merge the section boundary exists to prevent — the
+// cost is some chunks well under target, which is the cheaper mistake.
+func splitSections(text string, opts ChunkOptions) []string {
+	var chunks []string
+	for _, sec := range Sections(text) {
+		chunks = append(chunks, splitFlat(sec.Body, opts, sec.Path)...)
+	}
+	return chunks
+}
+
+// splitFlat is the paragraph/sentence/word splitter. prefix, when set, is the
+// heading path prepended to every chunk it produces.
+func splitFlat(text string, opts ChunkOptions, prefix string) []string {
+	// The prefix costs tokens in every chunk, so it comes out of the budget
+	// rather than silently pushing chunks over it.
+	target := opts.TargetTokens
+	if prefix != "" {
+		if t := target - estimateTokens(prefix); t > 0 {
+			target = t
+		}
+	}
+	units := segmentize(text, target)
 
 	var chunks []string
 	var cur []string
 	curTok := 0
 	emit := func(text string) {
-		if hasProse(text, opts.MinWords) {
-			chunks = append(chunks, text)
+		// MinWords is judged on the prose alone: the heading path is structure,
+		// not content, so counting it would let a prefix rescue a chunk that
+		// says nothing.
+		if !hasProse(text, opts.MinWords) {
+			return
 		}
+		if prefix != "" {
+			text = prefix + "\n\n" + text
+		}
+		chunks = append(chunks, text)
 	}
 	flush := func() {
 		if len(cur) == 0 {
@@ -94,7 +146,7 @@ func Split(text string, opts ChunkOptions) []string {
 	}
 	for _, u := range units {
 		ut := estimateTokens(u)
-		if curTok+ut > opts.TargetTokens {
+		if curTok+ut > target {
 			flush()
 		}
 		cur = append(cur, u)

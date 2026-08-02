@@ -3,8 +3,10 @@ package tiers
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/RootControl/dispatch/index"
+	"github.com/RootControl/dispatch/internal/par"
 	"github.com/RootControl/dispatch/llm"
 )
 
@@ -70,23 +72,33 @@ func confirmCoreference(ctx context.Context, l llm.LLM, cache *index.Cache, tag 
 		// A tie counts as no. Combined with treating errors as no, the whole
 		// mechanism biases toward leaving entities split — which loses some
 		// connections, where the opposite error invents them.
+		//
+		// The votes run concurrently. They are independent samples of the same
+		// prompt and only their tally is used, so nothing about the verdict
+		// depends on the order they return in — which makes this the one place
+		// in the build where concurrency cannot change the result at all.
+		var mu sync.Mutex
 		yes, asked := 0, 0
-		for range corefVotes {
+		_ = par.ForEach(ctx, corefVotes, corefVotes, func(ctx context.Context, _ int) error {
 			var out struct {
 				Same bool `json:"same"`
 			}
-			if err := l.ChatJSON(ctx, msgs, &out); err != nil {
+			err := l.ChatJSON(ctx, msgs, &out)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
 				n++
 				if first == nil {
 					first = fmt.Errorf("adjudicate %q vs %q: %w", short, long, err)
 				}
-				continue
+				return nil
 			}
 			asked++
 			if out.Same {
 				yes++
 			}
-		}
+			return nil
+		})
 		if asked == 0 {
 			return false // never cache a verdict nobody gave
 		}

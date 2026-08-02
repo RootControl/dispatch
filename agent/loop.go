@@ -36,6 +36,53 @@ type Loop struct {
 	// WriteBack extracts a durable takeaway after answering and stores it.
 	// Costs one extra LLM call per question.
 	WriteBack bool
+
+	// OnDelta, when set and when the LLM implements llm.Streamer, receives the
+	// answer in fragments as the model produces them. Only generation streams:
+	// the judge and the expander produce JSON nobody wants to watch assemble.
+	//
+	// Answer.Text still holds the whole answer, so a caller that streams to a
+	// terminal and a caller that does not get the same value back. Note the
+	// ordering that follows from that: citations are verified after the last
+	// fragment has already been printed, so a streamed answer can show a
+	// fabricated citation before the warning about it arrives.
+	OnDelta func(string)
+
+	// MaxCalls caps the LLM calls one Run may make — judge, expand, generate and
+	// write-back together. Zero means no cap.
+	//
+	// MaxSteps bounds rounds, which is not the same thing: enabling an expander
+	// adds a call per round, write-back adds one at the end, and a judge that
+	// never returns "sufficient" spends the full budget every time. This is the
+	// bound on what a single question can cost, expressed in the unit that is
+	// actually billed.
+	//
+	// Hitting it is not an error. The loop stops retrieving and answers from
+	// what it has, because a budget is a limit on effort rather than a
+	// declaration that the question was bad.
+	MaxCalls int
+
+	// Expander, when set, rewrites each query into text better suited to dense
+	// retrieval before the fan-out. Costs one LLM call per round. See HyDE.
+	Expander Expander
+
+	// Diversity, when enabled, drops evidence that restates evidence already
+	// held — overlapping adjacent chunks, or a summary of a passage alongside
+	// the passage. Off by default: it discards retrieved evidence, and doing
+	// that silently to someone who did not ask is the wrong default.
+	Diversity Diversity
+
+	// CitationPolicy decides what happens when the model cites a source that is
+	// not in the evidence. Default CiteReport: recorded on the Answer and in
+	// the trace, answer returned unchanged.
+	CitationPolicy CitationPolicy
+
+	// Filter scopes every retrieval to chunks whose metadata matches. Tiers
+	// that cannot apply it — anything not implementing core.Filterable — are
+	// dropped from the fan-out rather than allowed to answer from outside the
+	// scope, and the trace records which. A filter that leaves no tier standing
+	// is an error, not a silent empty answer.
+	Filter core.Filter
 }
 
 func (l *Loop) defaults() (maxSteps, topK, maxEvidence int) {
@@ -74,19 +121,65 @@ func (l *Loop) Run(ctx context.Context, question string) (Answer, error) {
 			reason += "; memory always consulted"
 		}
 	}
+	// Drop tiers that cannot honour the filter. Doing this once, before the
+	// first round, keeps the judge's view of "available tiers" honest too — it
+	// should not be told to refine into a tier the filter has ruled out.
+	if !l.Filter.Empty() {
+		kept, dropped := l.filterable(tierSet)
+		if len(kept) == 0 {
+			return Answer{Trace: tr}, fmt.Errorf(
+				"agent: filter %v leaves no usable tier (none of %v applies metadata filters)", l.Filter, tierSet)
+		}
+		if len(dropped) > 0 {
+			reason += fmt.Sprintf("; %v skipped: cannot filter", dropped)
+		}
+		tierSet = kept
+	}
 	tr.add(Step{Kind: StepRoute, Tiers: tierSet, Detail: reason})
 
 	query := question
 	var evidence []core.Result
 
 	for step := 1; step <= maxSteps; step++ {
+		// Check the deadline explicitly. fanOut records a tier's error and
+		// carries on, which is right for one tier failing and wrong for a
+		// cancelled context: every tier would fail, evidence would be empty,
+		// and the loop would report "no evidence retrieved" — a timeout
+		// misattributed as an empty corpus.
+		if err := ctx.Err(); err != nil {
+			return Answer{Trace: tr}, fmt.Errorf("agent: %w", err)
+		}
 		tr.Rounds = step
-		got := l.fanOut(ctx, tierSet, query, topK, tr)
-		evidence = merge(evidence, got, maxEvidence)
+
+		// Expand per round, not once: the judge's refined query is a different
+		// question and deserves its own hypothetical. A failure costs the
+		// improvement, not the answer.
+		expanded := ""
+		if l.Expander != nil && l.canSpend(tr) {
+			var err error
+			expanded, err = l.Expander.Expand(ctx, query)
+			tr.Calls++
+			switch {
+			case err != nil:
+				tr.add(Step{Kind: StepExpand, Detail: "failed, retrieving as written: " + err.Error()})
+			case expanded == "":
+				tr.add(Step{Kind: StepExpand, Detail: "no expansion made"})
+			default:
+				tr.add(Step{Kind: StepExpand, Detail: truncate(expanded, 70)})
+			}
+		}
+
+		got := l.fanOut(ctx, tierSet, query, expanded, topK, tr)
+		evidence = l.mergeEvidence(evidence, got, maxEvidence, tr)
 
 		// Judging on the final step would spend a call on a verdict we cannot
 		// act on, so skip it and go straight to generation.
 		if step == maxSteps {
+			break
+		}
+		if !l.canSpend(tr) {
+			tr.add(Step{Kind: StepJudge, Sufficient: true,
+				Detail: fmt.Sprintf("call budget reached (%d), answering from what was retrieved", l.MaxCalls)})
 			break
 		}
 		j, err := l.judge(ctx, question, query, evidence)
@@ -113,8 +206,12 @@ func (l *Loop) Run(ctx context.Context, question string) (Answer, error) {
 		// loop dropped semantic — which held the missing fact — and then spent
 		// its remaining rounds re-querying the same graph edges and learning
 		// nothing. A suggestion is a reordering, not an exclusion.
+		//
+		// The judge may name a registered tier the router did not pick, which is
+		// how it corrects a misroute — so this admits tiers outside tierSet. The
+		// one thing it must not readmit is a tier the filter ruled out.
 		if t := core.Tier(strings.TrimSpace(j.NextTier)); t != "" {
-			if _, ok := l.Retrievers[t]; ok {
+			if ok := l.canUse(t); ok {
 				promoted := []core.Tier{t}
 				for _, existing := range tierSet {
 					if existing != t {
@@ -126,6 +223,9 @@ func (l *Loop) Run(ctx context.Context, question string) (Answer, error) {
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return Answer{Trace: tr}, fmt.Errorf("agent: %w", err)
+	}
 	if len(evidence) == 0 {
 		return Answer{Trace: tr}, fmt.Errorf("agent: no evidence retrieved for %q", question)
 	}
@@ -136,11 +236,31 @@ func (l *Loop) Run(ctx context.Context, question string) (Answer, error) {
 	}
 
 	start := time.Now()
-	text, err := generate(ctx, l.LLM, question, memoryBlock, evidence)
+	text, err := generate(ctx, l.LLM, question, memoryBlock, evidence, l.OnDelta)
 	tr.Calls++
 	tr.add(Step{Kind: StepGenerate, Results: len(evidence), Elapsed: time.Since(start)})
 	if err != nil {
 		return Answer{Trace: tr}, err
+	}
+
+	// Resolve the answer's citations against the evidence it was given. The
+	// eval has always checked this; the library did not, so a fabricated
+	// citation reached the caller with nothing to distinguish it from a real
+	// one. It costs no LLM call — the answer and the evidence are both in hand.
+	report := VerifyCitations(text, evidence)
+	verify := Step{Kind: StepVerify, Results: len(report.Resolved)}
+	if !report.OK() {
+		verify.Detail = "FABRICATED: " + strings.Join(report.Unresolved, " ")
+	}
+	tr.add(verify)
+	switch {
+	case report.OK():
+	case l.CitationPolicy == CiteError:
+		return Answer{Text: text, Evidence: evidence, Trace: tr, Citations: report},
+			fmt.Errorf("agent: answer cites %d source(s) not in evidence: %s",
+				len(report.Unresolved), strings.Join(report.Unresolved, " "))
+	case l.CitationPolicy == CiteStrip:
+		text = stripCitations(text, report.Unresolved)
 	}
 
 	// Write-back is best-effort: a failure here means the next session starts
@@ -158,13 +278,57 @@ func (l *Loop) Run(ctx context.Context, question string) (Answer, error) {
 		}
 	}
 
-	return Answer{Text: text, Evidence: evidence, Trace: tr}, nil
+	return Answer{Text: text, Evidence: evidence, Trace: tr, Citations: report}, nil
+}
+
+// canSpend reports whether an optional call — an expansion or a judge verdict —
+// still fits in the budget.
+//
+// It reserves one call for generation. Spending the last of the budget on a
+// judge would leave the loop with evidence it cannot turn into an answer, which
+// is the worst possible place to run out: everything was paid for and nothing
+// was produced.
+func (l *Loop) canSpend(tr *Trace) bool {
+	if l.MaxCalls <= 0 {
+		return true
+	}
+	return tr.Calls+1 < l.MaxCalls
+}
+
+// canUse reports whether a tier is registered and, when a filter is set, able
+// to apply it.
+func (l *Loop) canUse(t core.Tier) bool {
+	r, ok := l.Retrievers[t]
+	if !ok {
+		return false
+	}
+	if l.Filter.Empty() {
+		return true
+	}
+	_, filterable := r.(core.Filterable)
+	return filterable
+}
+
+// filterable splits a tier set into those whose retriever applies Query.Filter
+// and those that do not. An unregistered tier stays in the kept set so it
+// produces its usual "no retriever registered" trace entry rather than being
+// silently reclassified as a filtering problem.
+func (l *Loop) filterable(tierSet []core.Tier) (kept, dropped []core.Tier) {
+	for _, t := range tierSet {
+		r, ok := l.Retrievers[t]
+		if _, isFilterable := r.(core.Filterable); !ok || isFilterable {
+			kept = append(kept, t)
+		} else {
+			dropped = append(dropped, t)
+		}
+	}
+	return kept, dropped
 }
 
 // fanOut retrieves from every named tier concurrently. A tier that errors is
 // recorded and skipped rather than failing the whole round: partial evidence
 // still beats none, and the judge will see the gap.
-func (l *Loop) fanOut(ctx context.Context, tierSet []core.Tier, query string, topK int, tr *Trace) []core.Result {
+func (l *Loop) fanOut(ctx context.Context, tierSet []core.Tier, query, expanded string, topK int, tr *Trace) []core.Result {
 	type outcome struct {
 		tier    core.Tier
 		results []core.Result
@@ -183,7 +347,8 @@ func (l *Loop) fanOut(ctx context.Context, tierSet []core.Tier, query string, to
 		go func(i int, t core.Tier, r core.Retriever) {
 			defer wg.Done()
 			start := time.Now()
-			got, err := r.Retrieve(ctx, core.Query{Text: query, TopK: topK})
+			got, err := r.Retrieve(ctx, core.Query{
+				Text: query, Expanded: expanded, TopK: topK, Filter: l.Filter})
 			outcomes[i] = outcome{tier: t, results: got, err: err, elapsed: time.Since(start)}
 		}(i, t, r)
 	}
@@ -199,6 +364,41 @@ func (l *Loop) fanOut(ctx context.Context, tierSet []core.Tier, query string, to
 		all = append(all, o.results...)
 	}
 	return all
+}
+
+// mergeEvidence folds a round's results into the evidence set, applying
+// near-duplicate suppression when it is enabled.
+//
+// Suppression runs over the whole set rather than only the new arrivals,
+// because redundancy is a property of the pair: a chunk that restates one held
+// since round one is just as wasteful as two arriving together. Re-selecting
+// each round costs a Jaccard over at most MaxEvidence items and keeps the rule
+// "no two items in the evidence say the same thing" true rather than
+// approximately true.
+func (l *Loop) mergeEvidence(existing, incoming []core.Result, maxEvidence int, tr *Trace) []core.Result {
+	if !l.Diversity.Enabled {
+		return merge(existing, incoming, maxEvidence)
+	}
+	// Merge with no cap first, so suppression chooses which items fill the
+	// budget rather than inheriting whatever arrived before it was full.
+	all := merge(existing, incoming, len(existing)+len(incoming))
+	kept, drops := selectDiverse(all, l.Diversity, maxEvidence)
+	if len(drops) > 0 {
+		var b strings.Builder
+		for i, d := range drops {
+			if i == 4 {
+				fmt.Fprintf(&b, " ... +%d more", len(drops)-4)
+				break
+			}
+			if i > 0 {
+				b.WriteByte(' ')
+			}
+			fmt.Fprintf(&b, "%s (%s)", d.cite, d.reason)
+		}
+		tr.add(Step{Kind: StepDiverse, Results: len(kept),
+			Detail: fmt.Sprintf("dropped %d: %s", len(drops), b.String())})
+	}
+	return kept
 }
 
 // merge appends new results to existing evidence, dropping duplicates by

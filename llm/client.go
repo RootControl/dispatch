@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,6 +36,9 @@ type Client struct {
 	cfg    Config
 	http   *http.Client
 	tokens chan struct{} // semaphore; cap == MaxConcurrent
+
+	usageMu sync.Mutex
+	used    Usage
 }
 
 var _ LLM = (*Client)(nil)
@@ -82,6 +86,38 @@ func New(cfg Config) (*Client, error) {
 func (c *Client) ChatModel() string  { return c.cfg.ChatModel }
 func (c *Client) EmbedModel() string { return c.cfg.EmbedModel }
 
+// Usage is the running token total for a Client.
+type Usage struct {
+	Calls            int
+	PromptTokens     int
+	CompletionTokens int
+}
+
+// Total returns prompt plus completion tokens.
+func (u Usage) Total() int { return u.PromptTokens + u.CompletionTokens }
+
+// Usage reports what this client has spent since it was created.
+//
+// The counters come from the server's own usage block, not an estimate: a
+// server that omits it leaves them at zero, which reads as "not reported"
+// rather than as a wrong number. Calls counts every chat request including
+// retries, so a model that had to be asked twice shows as two.
+func (c *Client) Usage() Usage {
+	c.usageMu.Lock()
+	defer c.usageMu.Unlock()
+	return c.used
+}
+
+func (c *Client) account(u *usage) {
+	c.usageMu.Lock()
+	defer c.usageMu.Unlock()
+	c.used.Calls++
+	if u != nil {
+		c.used.PromptTokens += u.PromptTokens
+		c.used.CompletionTokens += u.CompletionTokens
+	}
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -113,7 +149,17 @@ type chatResp struct {
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
+	Usage *usage    `json:"usage"`
 	Error *apiError `json:"error"`
+}
+
+// usage is the token accounting OpenAI-compatible servers return. Ollama and
+// llama.cpp both send it; a server that does not simply leaves the counters at
+// zero, which Usage reports as such rather than as an estimate.
+type usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 type embedReq struct {
@@ -178,6 +224,9 @@ func (c *Client) chat(ctx context.Context, messages []Message, jsonMode bool) (s
 	if err := c.do(ctx, "/chat/completions", body, &resp); err != nil {
 		return "", err
 	}
+	// Account before checking for an error: a call that spent tokens and then
+	// returned nothing usable is exactly the one worth seeing in the total.
+	c.account(resp.Usage)
 	if resp.Error != nil {
 		return "", resp.Error
 	}

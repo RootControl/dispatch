@@ -6,6 +6,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 // Tier names a kind of retrieval. Each tier answers a different kind of
@@ -58,7 +59,61 @@ func (c Chunk) Embedded() string {
 type Query struct {
 	Text string
 	TopK int
+	// Expanded, when set, is what dense retrieval embeds instead of Text: a
+	// hypothetical answer passage written for this question (HyDE). Lexical
+	// retrieval keeps using Text — see Embedding.
+	Expanded string
+	Filter   Filter
 }
+
+// Embedding returns the text a dense retriever should embed: Expanded when an
+// expansion was written, otherwise the query itself.
+//
+// Lexical retrieval deliberately does not use it. A hypothetical answer is
+// invented text, and BM25 scores rare terms highly — so every plausible-sounding
+// noun the model made up would become a high-idf term matching whatever
+// coincidentally shares it. The embedding lives in a space where an invented
+// passage lands near real ones about the same subject; the term index has no
+// such forgiveness. Expansion helps the half that can absorb it.
+func (q Query) Embedding() string {
+	if q.Expanded != "" {
+		return q.Expanded
+	}
+	return q.Text
+}
+
+// Filter restricts retrieval to chunks whose Meta matches every entry. A value
+// ending in "*" matches by prefix, which is what scoping to a subdirectory
+// needs; anything else must match exactly. An empty Filter matches everything.
+//
+// Only tiers backed by an index.Store — semantic and archival memory — can
+// apply it. The hierarchical, relational and structured tiers retrieve over
+// derived artifacts that carry no document metadata, so they cannot. Rather
+// than let those tiers quietly return evidence from outside the filter, the
+// agent loop skips any retriever that does not implement Filterable and records
+// the omission in the trace.
+type Filter map[string]string
+
+// Match reports whether meta satisfies every entry in f.
+func (f Filter) Match(meta map[string]string) bool {
+	for k, want := range f {
+		got, ok := meta[k]
+		if !ok {
+			return false
+		}
+		if pre, isPrefix := strings.CutSuffix(want, "*"); isPrefix {
+			if !strings.HasPrefix(got, pre) {
+				return false
+			}
+		} else if got != want {
+			return false
+		}
+	}
+	return true
+}
+
+// Empty reports whether f constrains anything.
+func (f Filter) Empty() bool { return len(f) == 0 }
 
 // Result is one piece of retrieved evidence. Score is tier-local and not
 // comparable across tiers — the loop treats it as a within-tier ranking only.
@@ -87,4 +142,18 @@ type Retriever interface {
 	// nil error is valid and means "nothing relevant here" — the loop reads that
 	// as a gap, not a failure.
 	Retrieve(ctx context.Context, q Query) ([]Result, error)
+}
+
+// Filterable marks a Retriever that applies Query.Filter. It exists so the
+// agent loop can tell "returned nothing inside the filter" from "ignored the
+// filter and returned something outside it" — indistinguishable from the
+// results alone, and the difference between a filter that scopes a query and
+// one that merely appears to.
+//
+// Implement it only if Retrieve genuinely honours the filter. Claiming it
+// falsely is worse than not implementing it: the loop trusts this.
+type Filterable interface {
+	Retriever
+	// HonorsFilter reports that Retrieve applies Query.Filter.
+	HonorsFilter()
 }

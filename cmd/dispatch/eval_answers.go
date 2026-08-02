@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"regexp"
 	"strings"
 
 	"github.com/RootControl/dispatch/agent"
@@ -58,30 +57,6 @@ type answerCase struct {
 	Note          string   `json:"note,omitempty"`
 }
 
-// bracketRE finds any bracketed span; pairRE finds tier:source pairs inside one.
-//
-// Two patterns rather than one because models group citations: asked for
-// [tier:source] markers, gemma4 emitted
-// "[semantic:a.md#0, semantic:a.md#1, semantic:a.md#6]" — three citations in a
-// single bracket. A single-marker regex finds none of them and the citation
-// check then passes vacuously, which is worse than failing.
-var (
-	bracketRE = regexp.MustCompile(`\[[^\]]+\]`)
-	pairRE    = regexp.MustCompile(`([a-z]+):([^\s,\]]+)`)
-)
-
-// extractCitations returns every citation in text, normalized to the canonical
-// [tier:source] form so it can be compared against Result.Cite().
-func extractCitations(text string) []string {
-	var out []string
-	for _, bracket := range bracketRE.FindAllString(text, -1) {
-		for _, p := range pairRE.FindAllStringSubmatch(bracket, -1) {
-			out = append(out, "["+p[1]+":"+p[2]+"]")
-		}
-	}
-	return out
-}
-
 // scored is one case's outcome, decomposed so a failure points at its cause.
 type answerScore struct {
 	retrieved    bool // a expected source reached the evidence
@@ -116,7 +91,8 @@ func evalAnswers(args []string) error {
 	sqlDir := fs.String("sql-dir", "", "CSV tables enabling the structured tier")
 	maxHops := fs.Int("max-hops", 2, "relational traversal depth")
 	llmRoute := fs.Bool("llm-router", false, "classify with the model instead of keywords")
-	rerank := fs.Bool("rerank", false, "rescore the retrieved shortlist with the model")
+	rerank := fs.Bool("rerank", false, "rescore the retrieved shortlist with a cross-encoder (needs RERANK_BASE_URL)")
+	rerankLLM := fs.Bool("rerank-llm", false, "rescore with the chat model instead — measured worse than no reranking")
 	verbose := fs.Bool("v", false, "show the answer text for every case")
 	jobs := fs.Int("jobs", defaultJobs, "cases to evaluate concurrently")
 	if err := fs.Parse(args); err != nil {
@@ -136,7 +112,7 @@ func evalAnswers(args []string) error {
 	}
 
 	st, err := buildStack(stackOptions{
-		IndexPath: *indexPath, SQLDir: *sqlDir, MaxHops: *maxHops, Rerank: *rerank,
+		IndexPath: *indexPath, SQLDir: *sqlDir, MaxHops: *maxHops, Rerank: *rerank, RerankLLM: *rerankLLM,
 	})
 	if err != nil {
 		return err
@@ -221,7 +197,7 @@ func scoreAnswer(ctx context.Context, loop *agent.Loop, c answerCase, verbose bo
 	// Every marker in the answer must resolve to evidence that was actually
 	// retrieved. A marker that does not is a fabricated citation — the failure
 	// mode a grounded system exists to prevent, and invisible without this check.
-	for _, m := range extractCitations(ans.Text) {
+	for _, m := range agent.ExtractCitations(ans.Text) {
 		if !cited[m] {
 			s.badCitations = append(s.badCitations, m)
 		}

@@ -26,8 +26,9 @@ type LLM struct {
 	// Dims is the embedding width. Default 64.
 	Dims int
 
-	mu    sync.Mutex
-	calls int // total Chat+ChatJSON invocations, for assertions
+	mu     sync.Mutex
+	calls  int // total Chat+ChatJSON invocations, for assertions
+	embeds int // total texts passed to Embed, for assertions
 }
 
 var _ llm.LLM = (*LLM)(nil)
@@ -38,6 +39,15 @@ func (f *LLM) Calls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+// Embeds reports how many texts have been passed to Embed — the equivalent
+// assertion for the embedding cache. It counts texts rather than calls, since
+// batching means one call can carry a whole document.
+func (f *LLM) Embeds() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.embeds
 }
 
 func (f *LLM) Chat(ctx context.Context, messages []llm.Message) (string, error) {
@@ -68,6 +78,9 @@ func (f *LLM) ChatJSON(ctx context.Context, messages []llm.Message, out any) err
 // bag-of-token-hashes: vectors for texts that share tokens point in similar
 // directions, so cosine similarity is meaningful enough to exercise ranking.
 func (f *LLM) Embed(ctx context.Context, inputs []string) ([][]float64, error) {
+	f.mu.Lock()
+	f.embeds += len(inputs)
+	f.mu.Unlock()
 	dims := f.Dims
 	if dims <= 0 {
 		dims = 64

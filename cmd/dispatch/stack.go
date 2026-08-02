@@ -17,11 +17,13 @@ import (
 
 // stackOptions selects which tiers are assembled.
 type stackOptions struct {
-	IndexPath string
-	SQLDir    string // empty disables the structured tier
-	MaxHops   int
-	Remember  bool // enables the memory tier
-	Rerank    bool // rescore the retrieved shortlist with the model
+	IndexPath  string
+	SQLDir     string // empty disables the structured tier
+	MaxHops    int
+	Remember   bool // enables the memory tier
+	Rerank     bool // rescore the shortlist with a cross-encoder (RERANK_BASE_URL)
+	RerankLLM  bool // rescore with the chat model; measured worse than not reranking
+	AllowStale bool // answer from artifacts built against a different index
 }
 
 // artifactPath names a derived artifact next to its index, so a second corpus
@@ -47,11 +49,25 @@ type stack struct {
 // buildStack loads the index and registers every tier whose artifact exists.
 // A missing hierarchy or graph is normal — those are opt-in at ingest time.
 func buildStack(opts stackOptions) (*stack, error) {
-	store, client, err := newStore(false, 0, 0) // retrieval doesn't contextualize
+	store, client, err := newStore(false, 0, 0, false) // retrieval doesn't contextualize
 	if err != nil {
 		return nil, err
 	}
-	if opts.Rerank {
+	switch {
+	case opts.Rerank && opts.RerankLLM:
+		return nil, fmt.Errorf("choose one of --rerank and --rerank-llm")
+	case opts.Rerank:
+		// --rerank means the cross-encoder, because that is the one with a
+		// reason to work. A missing endpoint is an error rather than a fallback
+		// to the LLM reranker: measurements say that path makes retrieval
+		// worse, and silently taking it would attribute the loss to reranking
+		// in general.
+		ce, err := index.NewCrossEncoderFromEnv()
+		if err != nil {
+			return nil, fmt.Errorf("%w\n(use --rerank-llm for the chat-model reranker, which measured worse than no reranking)", err)
+		}
+		store.SetReranker(ce)
+	case opts.RerankLLM:
 		// Reranking on the utility model, not the answering one. Scoring a
 		// shortlist for relevance is a mechanical judgment, and doing it with an
 		// 8B thinking model took ~50s per query against ~2s — slow enough that
@@ -71,11 +87,16 @@ func buildStack(opts stackOptions) (*stack, error) {
 		},
 	}
 
+	gen := store.Generation()
+
 	hierarchyPath := artifactPath(opts.IndexPath, "hierarchy")
 	if _, err := os.Stat(hierarchyPath); err == nil {
 		h, err := tiers.LoadHierarchy(client, hierarchyPath)
 		if err != nil {
 			return nil, fmt.Errorf("load hierarchy: %w", err)
+		}
+		if err := checkStale("hierarchy", hierarchyPath, h.SourceGeneration(), gen, opts.AllowStale); err != nil {
+			return nil, err
 		}
 		st.registry[core.TierHierarchical] = h
 	}
@@ -85,6 +106,9 @@ func buildStack(opts stackOptions) (*stack, error) {
 		rel, err := tiers.LoadGraph(graphPath, opts.MaxHops)
 		if err != nil {
 			return nil, fmt.Errorf("load graph: %w", err)
+		}
+		if err := checkStale("graph", graphPath, rel.SourceGeneration(), gen, opts.AllowStale); err != nil {
+			return nil, err
 		}
 		st.registry[core.TierRelational] = rel
 	}
@@ -128,4 +152,51 @@ func (s *stack) router(useLLM bool) router.Router {
 		return router.LLM{LLM: s.client, Available: s.available}
 	}
 	return router.Heuristic{Available: s.available}
+}
+
+// rerankLabel names the reranker in eval output. The two paths must be
+// distinguishable in a results table: they are different enough that reporting
+// both as "rerank=true" would make the numbers uninterpretable.
+func rerankLabel(cross, viaLLM bool) string {
+	switch {
+	case cross:
+		return "cross-encoder"
+	case viaLLM:
+		return "llm"
+	}
+	return "off"
+}
+
+// checkStale refuses an artifact built from a different index generation.
+//
+// The failure it prevents is quiet and passes every other check. Incremental
+// ingest prunes a document from the index; the graph and the tree are separate
+// files rebuilt only under --graph/--hierarchy, so they keep that document's
+// chunks. The relational tier then cites them, and citation verification says
+// the answer is sound — because the marker does resolve to retrieved evidence.
+// It is the evidence that no longer exists.
+//
+// An artifact written before generations were recorded has no stamp; those are
+// allowed through with a warning rather than made unusable by an upgrade.
+func checkStale(kind, path, artifactGen, indexGen string, allow bool) error {
+	if artifactGen == "" {
+		fmt.Fprintf(os.Stderr,
+			"WARNING: %s at %s predates artifact generation stamps; it may describe documents the index no longer holds.\n"+
+				"Re-run `dispatch ingest --%s` to be sure.\n", kind, path, kind)
+		return nil
+	}
+	if artifactGen == indexGen {
+		return nil
+	}
+	if allow {
+		fmt.Fprintf(os.Stderr,
+			"WARNING: %s at %s was built from a different index (%s, now %s); it may cite documents the index no longer holds.\n",
+			kind, path, artifactGen, indexGen)
+		return nil
+	}
+	return fmt.Errorf(
+		"%s at %s was built from index generation %s but the index is now %s.\n"+
+			"The corpus changed since it was built, so it can answer from documents that no longer exist.\n"+
+			"Re-run `dispatch ingest --%s`, or pass --allow-stale to answer anyway",
+		kind, path, artifactGen, indexGen, kind)
 }

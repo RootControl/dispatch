@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -198,5 +199,76 @@ func TestWriteBackSkipsUnworthyExchanges(t *testing.T) {
 	}
 	if m.CoreLen() != 0 {
 		t.Errorf("nothing should have been stored, core has %d", m.CoreLen())
+	}
+}
+
+// Archival was documented as unbounded, which is fine for a session and wrong
+// for a process that runs for weeks: every takeaway is embedded and kept, so
+// the store grows without limit and search over it slows in step.
+func TestArchivalIsBounded(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory(MemoryConfig{
+		LLM: &fake.LLM{}, Dir: t.TempDir(),
+		CoreBudget: 40, ArchivalLimit: 3,
+	})
+
+	for i := range 12 {
+		if err := m.Remember(ctx, fmt.Sprintf("takeaway number %d about the atlas programme", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := m.ArchivalLen(); got > 3 {
+		t.Fatalf("archival holds %d entries under a cap of 3", got)
+	}
+	if m.ArchivalLen() == 0 {
+		t.Fatal("eviction emptied archival entirely")
+	}
+
+	// Oldest-first: the survivors must be the most recently *archived* entries.
+	// The newest takeaways are still in core and have not reached archival at
+	// all, so this asks about the boundary — the last thing evicted must have
+	// survived, and the first must not.
+	hits, err := m.Retrieve(ctx, core.Query{Text: "takeaway atlas programme", TopK: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kept []string
+	for _, h := range hits {
+		kept = append(kept, h.Text)
+	}
+	joined := strings.Join(kept, " | ")
+	if strings.Contains(joined, "number 0 ") {
+		t.Errorf("the oldest takeaway survived eviction: %s", joined)
+	}
+	if !strings.Contains(joined, "number 10") {
+		t.Errorf("the most recently archived takeaway was evicted: %s", joined)
+	}
+}
+
+// A negative limit means unbounded, so the previous behaviour stays reachable.
+func TestArchivalLimitNegativeIsUnbounded(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory(MemoryConfig{
+		LLM: &fake.LLM{}, Dir: t.TempDir(),
+		CoreBudget: 40, ArchivalLimit: -1,
+	})
+	for i := range 20 {
+		if err := m.Remember(ctx, fmt.Sprintf("takeaway number %d about the atlas programme", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if m.ArchivalLen() < 10 {
+		t.Errorf("archival holds %d entries with the cap disabled", m.ArchivalLen())
+	}
+}
+
+// mem-10 must sort after mem-9, not before it — a lexical sort would evict the
+// wrong entries as soon as the counter passed nine.
+func TestMemSeqSortsNumerically(t *testing.T) {
+	if memSeq("mem-10") <= memSeq("mem-9") {
+		t.Error("mem-10 sorts before mem-9")
+	}
+	if memSeq("nonsense") != 0 {
+		t.Error("an unparseable ID should sort oldest rather than panic")
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/RootControl/dispatch/core"
@@ -383,14 +384,17 @@ func TestExtractionJSONShape(t *testing.T) {
 // A long extraction run must not be discarded because one chunk failed. On a
 // real corpus this runs for tens of minutes; aborting at chunk 60 of 70 throws
 // away every earlier call.
+// The failing chunk is picked by its content, not by call order. Extraction
+// runs concurrently, so "the second call" is no longer a stable way to name a
+// chunk — and a test that says "one chunk fails" means a particular chunk,
+// which is what this now says.
 func TestBuildGraphSkipsUnextractableChunks(t *testing.T) {
-	var n int
 	f := &fake.LLM{ChatFunc: func(msgs []llm.Message) (string, error) {
-		n++
-		if n == 2 { // the middle chunk fails
+		last := msgs[len(msgs)-1].Content
+		if strings.Contains(last, "coastal wind") {
 			return "", errors.New("model returned reasoning but no answer")
 		}
-		if strings.Contains(msgs[len(msgs)-1].Content, "Priya") {
+		if strings.Contains(last, "Priya") {
 			return `{"entities":[{"name":"Priya Raman","type":"person"}],
 			         "relations":[{"from":"Priya Raman","relation":"reports to","to":"VP of Platform"}]}`, nil
 		}
@@ -613,10 +617,13 @@ func TestConfirmCoreferenceDefaultsToNoOnError(t *testing.T) {
 
 // Verdicts are cached, so a rebuild costs nothing.
 func TestConfirmCoreferenceCachesVerdicts(t *testing.T) {
+	var mu sync.Mutex
 	var calls int
 	cache := index.NewCache(t.TempDir())
 	f := &fake.LLM{ChatFunc: func([]llm.Message) (string, error) {
+		mu.Lock()
 		calls++
+		mu.Unlock()
 		return `{"same": true}`, nil
 	}}
 	confirm, _, _ := confirmCoreference(context.Background(), f, cache, "m1")
@@ -643,8 +650,15 @@ func TestConfirmCoreferenceTakesMajority(t *testing.T) {
 		"unanimous no":  {[]string{"false", "false", "false"}, false},
 	}
 	for name, tc := range cases {
+		// The votes are cast concurrently, so the replies are handed out under a
+		// lock and in no particular order. That is the right shape for what this
+		// asserts: the rule is a tally, not a sequence — "true, false, true" and
+		// "true, true, false" must both merge.
+		var mu sync.Mutex
 		var i int
 		f := &fake.LLM{ChatFunc: func([]llm.Message) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
 			r := tc.replies[i%len(tc.replies)]
 			i++
 			return `{"same": ` + r + `}`, nil

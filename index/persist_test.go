@@ -17,7 +17,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if _, err := orig.Ingest(ctx, []core.Doc{{ID: "atlas", Text: atlasDoc}}); err != nil {
 		t.Fatal(err)
 	}
-	want, err := orig.Search(ctx, "atlas budget", 4)
+	want, err := orig.Search(ctx, core.Query{Text: "atlas budget", TopK: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +34,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if loaded.Len() != orig.Len() {
 		t.Fatalf("chunk count %d, want %d", loaded.Len(), orig.Len())
 	}
-	got, err := loaded.Search(ctx, "atlas budget", 4)
+	got, err := loaded.Search(ctx, core.Query{Text: "atlas budget", TopK: 4})
 	if err != nil {
 		t.Fatal(err)
 	}

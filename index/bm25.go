@@ -39,7 +39,38 @@ func (bm *bm25Index) add(id, text string) {
 	bm.totalLen += len(toks)
 }
 
-func (bm *bm25Index) search(query string, n int) []scored {
+// remove drops every document whose id is in drop, decrementing the term
+// document-frequencies and corpus length it contributed. Those are what the idf
+// and length-normalisation terms are computed from, so leaving them behind would
+// score the remaining documents against a corpus that no longer exists.
+func (bm *bm25Index) remove(drop map[string]bool) {
+	if len(drop) == 0 {
+		return
+	}
+	kept := bm.docs[:0]
+	for _, d := range bm.docs {
+		if !drop[d.id] {
+			kept = append(kept, d)
+			continue
+		}
+		for t := range d.tf {
+			if bm.df[t]--; bm.df[t] <= 0 {
+				delete(bm.df, t)
+			}
+		}
+		bm.totalLen -= d.len
+	}
+	for i := len(kept); i < len(bm.docs); i++ {
+		bm.docs[i] = bm25Doc{}
+	}
+	bm.docs = kept
+}
+
+// search returns the n best-scoring documents that allow accepts. The corpus
+// statistics — average length and N for idf — stay over the whole index rather
+// than the filtered subset, so a term's rarity means the same thing whatever
+// filter is applied and two filters cannot disagree about what "rare" is.
+func (bm *bm25Index) search(query string, n int, allow func(string) bool) []scored {
 	if len(bm.docs) == 0 {
 		return nil
 	}
@@ -49,6 +80,9 @@ func (bm *bm25Index) search(query string, n int) []scored {
 
 	out := make([]scored, 0, len(bm.docs))
 	for _, d := range bm.docs {
+		if allow != nil && !allow(d.id) {
+			continue
+		}
 		var score float64
 		for _, q := range qterms {
 			tf, ok := d.tf[q]

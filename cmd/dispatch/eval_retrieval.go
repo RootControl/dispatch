@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/RootControl/dispatch/agent"
 	"github.com/RootControl/dispatch/core"
 	"github.com/RootControl/dispatch/index"
 	"github.com/RootControl/dispatch/llm"
@@ -42,7 +43,12 @@ func evalRetrieval(args []string) error {
 	indexPath := fs.String("index", defaultIndexPath, "index to probe")
 	topK := fs.Int("k", 5, "retrieve this many; recall is measured at this depth")
 	limit := fs.Int("limit", 0, "probe at most this many chunks (0 = all)")
-	rerank := fs.Bool("rerank", false, "rescore the shortlist before measuring")
+	rerank := fs.Bool("rerank", false, "rescore the shortlist with a cross-encoder before measuring (needs RERANK_BASE_URL)")
+	rerankLLM := fs.Bool("rerank-llm", false, "rescore with the chat model instead — measured worse than no reranking")
+	hyde := fs.Bool("hyde", false, "embed a hypothetical answer alongside each probe (one call per chunk)")
+	save := fs.String("save", "", "write this run's per-chunk ranks here, for a later --baseline")
+	baseline := fs.String("baseline", "", "compare against a run saved with --save")
+	label := fs.String("label", "", "name this run in comparison output (e.g. \"bge-reranker-base\")")
 	verbose := fs.Bool("v", false, "show every probe, not just misses")
 	questionsPath := fs.String("questions", "", "write the generated questions here, as answer-eval cases")
 	jobs := fs.Int("jobs", defaultJobs, "chunks to probe concurrently")
@@ -50,7 +56,7 @@ func evalRetrieval(args []string) error {
 		return err
 	}
 
-	st, err := buildStack(stackOptions{IndexPath: *indexPath, Rerank: *rerank})
+	st, err := buildStack(stackOptions{IndexPath: *indexPath, Rerank: *rerank, RerankLLM: *rerankLLM})
 	if err != nil {
 		return err
 	}
@@ -69,7 +75,17 @@ func evalRetrieval(args []string) error {
 	cache := index.NewCache(defaultCacheDir)
 	semantic := tiers.NewSemantic(st.store)
 
-	fmt.Printf("=== retrieval recall: %d chunks, k=%d, rerank=%v ===\n\n", len(chunks), *topK, *rerank)
+	// Expansion runs on the utility model, the same one that writes the probe
+	// questions — which is fine here and worth naming: the generator sees only
+	// one chunk and the expander sees only the question, so neither knows what
+	// the right answer is.
+	var expander agent.Expander
+	if *hyde {
+		expander = &agent.HyDE{LLM: util}
+	}
+
+	fmt.Printf("=== retrieval recall: %d chunks, k=%d, rerank=%s, hyde=%v ===\n\n",
+		len(chunks), *topK, rerankLabel(*rerank, *rerankLLM), *hyde)
 
 	ctx := context.Background()
 
@@ -90,7 +106,13 @@ func evalRetrieval(args []string) error {
 			// recall over what remains is how a benchmark flatters itself.
 			return probe{skipped: true, err: err}
 		}
-		got, err := semantic.Retrieve(ctx, core.Query{Text: q, TopK: *topK})
+		query := core.Query{Text: q, TopK: *topK}
+		if expander != nil {
+			// An expander failure retrieves the query as written rather than
+			// failing the probe, matching what the loop does.
+			query.Expanded, _ = expander.Expand(ctx, q)
+		}
+		got, err := semantic.Retrieve(ctx, query)
 		if err != nil {
 			return probe{question: q, fresh: fresh, err: err}
 		}
@@ -105,6 +127,8 @@ func evalRetrieval(args []string) error {
 	})
 
 	var probed, hitAt1, hitAtK, generated, cached, skipped int
+	ranks := make(map[string]int, len(chunks))
+	texts := make(map[string]string, len(chunks))
 	var misses []string
 	var cases []answerCase
 	for i, p := range probes {
@@ -116,6 +140,8 @@ func evalRetrieval(args []string) error {
 		if p.err != nil {
 			return p.err
 		}
+		ranks[c.ID] = p.rank
+		texts[c.ID] = chunkDigest(c.Embedded())
 		if p.fresh {
 			generated++
 		} else {
@@ -159,6 +185,26 @@ func evalRetrieval(args []string) error {
 	fmt.Printf("\nquestions: %d generated, %d from cache\n", generated, cached)
 	fmt.Printf("recall@1:  %d/%d (%.0f%%)\n", hitAt1, probed, 100*float64(hitAt1)/float64(probed))
 	fmt.Printf("recall@%d:  %d/%d (%.0f%%)\n", *topK, hitAtK, probed, 100*float64(hitAtK)/float64(probed))
+
+	run := retrievalRun{Label: *label, TopK: *topK, Ranks: ranks, Texts: texts}
+	if run.Label == "" {
+		run.Label = fmt.Sprintf("rerank=%s hyde=%v k=%d", rerankLabel(*rerank, *rerankLLM), *hyde, *topK)
+	}
+	// Compare before saving, so `--save x --baseline x` diffs against the
+	// previous run rather than against what this one just wrote.
+	if *baseline != "" {
+		base, err := loadRun(*baseline)
+		if err != nil {
+			return err
+		}
+		compareRuns(base, run)
+	}
+	if *save != "" {
+		if err := saveRun(*save, run); err != nil {
+			return err
+		}
+		fmt.Printf("\nsaved %d per-chunk ranks to %s\n", len(ranks), *save)
+	}
 
 	if *questionsPath != "" {
 		if err := writeCases(*questionsPath, cases); err != nil {

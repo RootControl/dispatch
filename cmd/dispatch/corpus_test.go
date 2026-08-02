@@ -5,8 +5,6 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
-
-	"github.com/RootControl/dispatch/core"
 )
 
 // write creates path with content, making parents as needed.
@@ -18,14 +16,6 @@ func write(t *testing.T, path, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func docIDs(docs []core.Doc) []string {
-	out := make([]string, len(docs))
-	for i, d := range docs {
-		out[i] = d.ID
-	}
-	return out
 }
 
 // Pointing --corpus at a real repository must not ingest its dependencies. A

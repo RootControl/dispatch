@@ -20,6 +20,7 @@ const (
 	StepVerify   StepKind = "verify"
 	StepDiverse  StepKind = "diverse"
 	StepExpand   StepKind = "expand"
+	StepRewrite  StepKind = "rewrite"
 )
 
 // Step is one recorded action. Not every field applies to every kind; the
@@ -77,6 +78,10 @@ func (t *Trace) String() string {
 			fmt.Fprintf(&b, " %d evidence item(s) kept", s.Results)
 		case StepExpand:
 			fmt.Fprint(&b, " hypothetical passage")
+		case StepRewrite:
+			// The question the corpus was actually searched with. Without this
+			// line a follow-up's trace shows a retrieval for words nobody typed.
+			fmt.Fprintf(&b, " asked as %q", truncate(s.Query, 70))
 		}
 		if s.Detail != "" {
 			fmt.Fprintf(&b, " — %s", s.Detail)

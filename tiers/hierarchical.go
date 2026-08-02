@@ -8,6 +8,7 @@ import (
 
 	"github.com/RootControl/dispatch/core"
 	"github.com/RootControl/dispatch/index"
+	"github.com/RootControl/dispatch/internal/par"
 	"github.com/RootControl/dispatch/llm"
 )
 
@@ -44,6 +45,11 @@ type HierarchyOptions struct {
 	// different embedding model fails loudly instead of searching one embedding
 	// space with another's query vector.
 	EmbedTag string
+	// Parallelism bounds concurrent summary calls within a level; default 4.
+	// Levels stay sequential because level N+1 clusters level N's summaries, so
+	// there is nothing to overlap between them — the width is inside a level,
+	// where the clusters are genuinely independent.
+	Parallelism int
 }
 
 func (o HierarchyOptions) withDefaults() HierarchyOptions {
@@ -101,27 +107,46 @@ func BuildHierarchy(ctx context.Context, l llm.LLM, leaves *index.Store, opts Hi
 		}
 
 		clusters := kmeans(vecs, k, 10)
-		summaries := make([]string, 0, len(clusters))
-		for _, cluster := range clusters {
-			members := make([]string, 0, len(cluster))
-			for _, i := range cluster {
+		// Summaries are written into their cluster's slot rather than appended,
+		// so the tree does not depend on which call returned first. Node IDs are
+		// positional (L1-0, L1-1, ...) and citations quote them, so appending in
+		// completion order would renumber the tree on every rebuild and make a
+		// saved citation point somewhere else.
+		summaries := make([]string, len(clusters))
+		hits, calls := make([]bool, len(clusters)), make([]bool, len(clusters))
+		err := par.ForEach(ctx, len(clusters), parallelism(opts.Parallelism), func(ctx context.Context, ci int) error {
+			members := make([]string, 0, len(clusters[ci]))
+			for _, i := range clusters[ci] {
 				members = append(members, texts[i])
 			}
 			// Key on the members themselves, so a cluster that survives a
 			// rebuild unchanged costs nothing even if its level number moved.
 			key := index.Key("summary|"+opts.CacheTag, strconv.Itoa(len(members)), strings.Join(members, "\x00"))
 			if cached, ok := opts.Cache.Get(key); ok && strings.TrimSpace(cached) != "" {
-				stats.CacheHits++
-				summaries = append(summaries, cached)
-				continue
+				summaries[ci], hits[ci] = cached, true
+				return nil
 			}
 			s, err := summarize(ctx, l, members)
 			if err != nil {
-				return nil, stats, fmt.Errorf("tiers: summarize level %d: %w", level, err)
+				return fmt.Errorf("tiers: summarize level %d: %w", level, err)
 			}
-			stats.LLMCalls++
 			_ = opts.Cache.Put(key, s)
-			summaries = append(summaries, s)
+			summaries[ci], calls[ci] = s, true
+			return nil
+		})
+		// Unlike graph extraction, a failed summary is fatal here and was
+		// before: a level with a missing node is not a smaller tree, it is a
+		// tree with a hole in it, and every level above inherits the hole.
+		if err != nil {
+			return nil, stats, err
+		}
+		for i := range clusters {
+			if hits[i] {
+				stats.CacheHits++
+			}
+			if calls[i] {
+				stats.LLMCalls++
+			}
 		}
 
 		// One embedding call per level, not per summary, and only for the

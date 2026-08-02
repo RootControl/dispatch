@@ -54,10 +54,14 @@ func main() {
 		err = runIngest(os.Args[2:])
 	case "ask":
 		err = runAsk(os.Args[2:])
+	case "chat":
+		err = runChat(os.Args[2:])
 	case "eval":
 		err = runEval(os.Args[2:])
 	case "index":
 		err = runIndex(os.Args[2:])
+	case "graph":
+		err = runGraph(os.Args[2:])
 	case "cache":
 		err = runCache(os.Args[2:])
 	default:
@@ -75,10 +79,13 @@ func usage() {
 
   dispatch ingest --corpus DIR [--index PATH] [--dry-run] [--no-context] [--full]
                   [--chunk-tokens N] [--min-words N] [--exclude DIRS] [--hierarchy] [--graph]
-                  [--utility-model NAME]
+                  [--utility-model NAME] [--jobs N]
 
   dispatch ask [--index PATH] [--trace] [-k N] [--max-steps N] [--llm-router]
                [--remember] [--sql-dir DIR] [--max-hops N] [--rerank] [--retrieve-only] "question"
+
+  dispatch chat [--index PATH] [--trace] [-k N] [--no-rewrite]      # multi-turn: follow-ups
+                [--always-rewrite] [--turns N] [--stream]           # resolve against history
 
   dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]   # routing accuracy
   dispatch eval answers [--index PATH] [--cases FILE] [-k N] [-v]   # answer quality
@@ -87,6 +94,7 @@ func usage() {
   dispatch eval self-check [--index PATH] [-k N]                    # can the eval still fail?
 
   dispatch index [docs|show ID] [--index PATH]                      # what is actually indexed
+  dispatch graph [entities|aliases|show KEY|seeds "question"]       # what the entity graph holds
   dispatch cache [gc [--index PATH]...] [--dry-run]                 # cache size and collection
 
 Artifacts live beside their index: --index .dispatch/x.json puts the summary tree
@@ -126,6 +134,15 @@ func utilityLLM(client *llm.Client) (*llm.Client, string, bool) {
 // single lever on ingest cost, trying one should not require a config change.
 var utilityOverride string
 
+// ingestJobs is `ingest --jobs`: how many LLM calls each ingest pass keeps in
+// flight. Zero means the package default of 4.
+//
+// It is one setting rather than three because the three passes never overlap —
+// contextual chunking finishes before extraction starts, which finishes before
+// the tree is built — so a single number is the whole concurrency story of an
+// ingest, and tuning it means matching it to the server's slot count.
+var ingestJobs int
+
 // newStore wires an index.Store to the configured endpoint. Cache and index are
 // tagged with the model names so swapping models invalidates derived data.
 func newStore(contextualize bool, chunkTokens, minWords int, headings bool) (*index.Store, *llm.Client, error) {
@@ -142,9 +159,10 @@ func newStore(contextualize bool, chunkTokens, minWords int, headings bool) (*in
 		// Cache and index are tagged with the model that PRODUCED them: context
 		// sentences come from the utility model, so switching it must invalidate
 		// them rather than silently reuse another model's work.
-		CacheTag: utilName,
-		EmbedTag: client.EmbedModel(),
-		Chunk:    index.ChunkOptions{TargetTokens: chunkTokens, MinWords: minWords, Headings: headings},
+		CacheTag:    utilName,
+		EmbedTag:    client.EmbedModel(),
+		Chunk:       index.ChunkOptions{TargetTokens: chunkTokens, MinWords: minWords, Headings: headings},
+		Parallelism: ingestJobs,
 	})
 	return s, client, nil
 }
@@ -164,10 +182,12 @@ func runIngest(args []string) error {
 	exclude := fs.String("exclude", "", "extra comma-separated directory names to skip (node_modules, .git, dist and friends are always skipped)")
 	full := fs.Bool("full", false, "rebuild from scratch instead of updating the existing index")
 	utilModel := fs.String("utility-model", "", "cheaper model for context sentences, extraction and summaries (overrides LLM_UTILITY_MODEL)")
+	jobs := fs.Int("jobs", 0, "concurrent LLM calls per ingest pass (0 = 4; use 1 for a server that serves one at a time)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	utilityOverride = *utilModel
+	ingestJobs = *jobs
 
 	docs, err := loadCorpus(*corpus, strings.Split(*exclude, ","))
 	if err != nil {
@@ -259,10 +279,11 @@ func runIngest(args []string) error {
 		util, utilName, _ := utilityLLM(client)
 		h, hstats, err := tiers.BuildHierarchy(context.Background(), util, store,
 			tiers.HierarchyOptions{
-				Branching: *branching,
-				Cache:     index.NewCache(defaultCacheDir),
-				CacheTag:  utilName,
-				EmbedTag:  client.EmbedModel(),
+				Branching:   *branching,
+				Cache:       index.NewCache(defaultCacheDir),
+				CacheTag:    utilName,
+				EmbedTag:    client.EmbedModel(),
+				Parallelism: ingestJobs,
 			})
 		if err != nil {
 			return err
@@ -281,8 +302,9 @@ func runIngest(args []string) error {
 	if *graph || graphExists {
 		util, utilName, _ := utilityLLM(client)
 		rel, gstats, err := tiers.BuildGraph(context.Background(), util, store, tiers.GraphOptions{
-			Cache:    index.NewCache(defaultCacheDir),
-			CacheTag: utilName,
+			Cache:       index.NewCache(defaultCacheDir),
+			CacheTag:    utilName,
+			Parallelism: ingestJobs,
 		})
 		if err != nil {
 			return err

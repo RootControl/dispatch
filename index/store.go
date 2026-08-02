@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"github.com/RootControl/dispatch/core"
+	"github.com/RootControl/dispatch/internal/par"
 	"github.com/RootControl/dispatch/llm"
 )
 
@@ -567,45 +568,9 @@ func (s *Store) Add(c core.Chunk, vector []float64) {
 }
 
 // forEachLimited runs fn for indices 0..n-1 with at most limit concurrent
-// goroutines, returning the first error and cancelling the rest.
+// goroutines, returning the first error and cancelling the rest. The
+// implementation moved to internal/par when the graph and hierarchy builds
+// needed the same thing.
 func forEachLimited(ctx context.Context, n, limit int, fn func(ctx context.Context, i int) error) error {
-	if limit <= 0 {
-		limit = 1
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	sem := make(chan struct{}, limit)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var firstErr error
-
-	for i := range n {
-		select {
-		case <-ctx.Done():
-			mu.Lock()
-			if firstErr == nil {
-				firstErr = ctx.Err()
-			}
-			mu.Unlock()
-			wg.Wait()
-			return firstErr
-		case sem <- struct{}{}:
-		}
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if err := fn(ctx, i); err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = err
-					cancel()
-				}
-				mu.Unlock()
-			}
-		}(i)
-	}
-	wg.Wait()
-	return firstErr
+	return par.ForEach(ctx, n, limit, fn)
 }

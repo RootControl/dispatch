@@ -127,12 +127,15 @@ questions about how things relate. Skip it if you only need content lookup.
 ```
 dispatch ingest --corpus DIR [--index PATH] [--dry-run] [--no-context] [--full]
                 [--chunk-tokens N] [--min-words N] [--headings] [--exclude DIRS]
-                [--hierarchy] [--graph] [--utility-model NAME]
+                [--hierarchy] [--graph] [--utility-model NAME] [--jobs N]
 
 dispatch ask [--index PATH] [--trace] [-k N] [--max-steps N] [--llm-router]
              [--remember] [--sql-dir DIR] [--max-hops N] [--filter K=V]
              [--rerank] [--retrieve-only] [--stream] [--json] [--diverse]
              [--per-doc N] [--hyde] [--timeout D] [--max-calls N] "question"
+
+dispatch chat [--index PATH] [--trace] [-k N] [--turns N]         # multi-turn: follow-ups
+              [--no-rewrite] [--always-rewrite] [--stream]         # resolve against history
 
 dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]   # routing accuracy
 dispatch eval answers [--index PATH] [--cases FILE] [-k N] [-v]   # answer quality
@@ -142,6 +145,7 @@ dispatch eval scale [--sizes N,N,N] [--queries N]                 # latency/memo
 dispatch eval self-check [--index PATH] [-k N]                    # can the eval still fail?
 
 dispatch index [docs|show ID] [--index PATH]                      # what is actually indexed
+dispatch graph [entities|aliases|show KEY|seeds "question"]       # what the entity graph holds
 dispatch cache [gc [--index PATH]...] [--dry-run]                 # cache size and collection
 ```
 
@@ -178,6 +182,77 @@ ingested 3 docs -> 3 chunks (2 context calls, 0 cache hits; 2 embedded, 0 cached
 cache as context sentences, so even a full rebuild re-embeds only chunks whose
 text actually changed — budget roughly 15 KB of cache per chunk at 768
 dimensions.
+
+### The slow ingest passes run concurrently
+
+Contextual chunking has always run four calls wide. Graph extraction and RAPTOR
+summarisation — measured in this README at ~42s and ~30s each, and between them
+most of a first ingest — ran one call at a time. `internal/par` is now shared by
+all three, and `--jobs N` sets the width.
+
+Two things had to stay true, and both are tested:
+
+- **The graph is byte-identical to the sequential build.** `addEntity` keeps a
+  display name as first seen and edges are appended, so applying results in
+  completion order would make `Entity.Name` — and every relationship an answer
+  renders — depend on which call returned first. Extraction runs concurrently;
+  results are *applied in chunk order*.
+- **The tree does not renumber itself.** Node IDs are positional (`L1-0`,
+  `L1-1`) and citations quote them, so a summary written into whichever slot
+  finished first would make a saved citation point at different text after a
+  rebuild.
+
+The determinism test compares a skewed parallel build against a serial one *and*
+asserts the display name absolutely. That second assertion is the one that
+works: reversing the apply order moves both builds together, so the comparison
+keeps passing and only the absolute check fails. A differential test cannot see
+a bug common to both sides.
+
+Coreference votes also run concurrently — three independent samples whose only
+use is a tally, so it is the one place here where concurrency provably cannot
+change the result.
+
+**On this machine it bought about 2%, and that is the honest number:**
+
+| `--jobs` | bundled corpus, 6 chunks |
+|---|---|
+| 1 | 10m29s |
+| 4 | 10m14s |
+| 8 | 10m16s |
+| 1 (repeat) | 10m33s |
+
+The ceiling is the server, not the client. Four concurrent 60-word completions
+against this Ollama ran **1.25x** faster than four serial ones — so the requests
+do overlap, barely, and a pass made of far larger requests overlaps less. This
+is the same wall the eval's `--jobs` already hit, and the section on
+`OLLAMA_NUM_PARALLEL` below applies unchanged.
+
+So: the concurrency is real and demonstrated (a test blocks every extraction
+until three are in flight, and only completes if they overlap), the determinism
+is real, and **the speedup is somebody else's** — a hosted endpoint, or a server
+configured for more than one slot. Measure it on yours before believing a
+number from this table.
+
+One thing to note is that run-to-run entity counts varied (30, 24, 32) and
+**that is not the concurrency**: it tracks the number of chunks whose extraction
+failed and was skipped, which the model does inconsistently.
+
+Which led to two related fixes, both about a failed build that did not look like
+one. Skipping a chunk is right when the rest succeed — extraction runs for tens
+of minutes and aborting at chunk 60 of 70 discards every earlier call — but two
+cases were being treated as "a smaller graph" when they are "no graph":
+
+- **A cancelled build.** Every outstanding chunk fails at once with the same
+  context error, so interrupting an ingest produced a graph holding whatever had
+  finished, stamped with the current index generation.
+- **A build where every chunk failed.** Found by running it: a slow endpoint
+  timed out on both chunks of a two-document corpus, and `ingest --graph` wrote
+  a graph with **zero entities** — over the previous good one.
+
+Both are stamped *current*, so the staleness check could never have caught
+either; it compares generations, and the generation was genuinely right. Both
+now return an error, which also means `ingest` never reaches the save and the
+previous artifact survives.
 
 ### Scoping a query with `--filter`
 
@@ -272,6 +347,37 @@ sentence contextual chunking wrote, which is otherwise invisible. "Did my
 document get ingested, and into how many chunks" previously had no answer short
 of asking a question and reading the citations, which conflates a chunking
 problem with a retrieval one.
+
+### Looking inside the entity graph
+
+`dispatch graph` does for the relational tier what `dispatch index` does for the
+semantic one, and it matters more, because the graph is the least legible thing
+this project builds: its entities come from a model reading one chunk at a time,
+and its aliases come from an automatic coreference pass this README calls the
+riskiest decision the tier makes.
+
+Every merge was printed at ingest and then lost with the terminal scrollback.
+`graph aliases` reads them back, with the edge count of each canonical entity, so
+an answer that connects two things it should not can be traced to the merge that
+connected them.
+
+`graph seeds "question"` answers the one question the tier could not:
+
+```bash
+dispatch graph seeds "who does Priya report to?"
+```
+
+When the relational tier returns nothing, there are two causes with opposite
+fixes — the graph holds nothing relevant, or the question named no entity the
+graph knows — and from the outside they looked identical. `seeds` separates
+them: it prints the entities the question starts from, then every edge reached
+within `--max-hops` and the chunk that asserted it. No seeds means the tier had
+no starting point and correctly declined to guess; that is a question-side
+failure, not a retrieval one.
+
+`graph entities --isolated` lists entities extracted but never connected to
+anything. They are the graph's dead weight: each one can seed a traversal that
+then reaches nothing.
 
 ### Collecting the cache
 
@@ -380,6 +486,61 @@ different text under the same chunk ID. That last check exists because the tool
 got it wrong on its first real use, confidently reporting per-chunk deltas
 across a re-chunking where the IDs matched and the content did not.
 
+### Following up on an answer
+
+`ask` is single-shot, and every retrieval path here matches a question against
+the corpus. That is exactly wrong for the second question in a conversation:
+
+```
+> What is Project Atlas?
+Project Atlas is ... [semantic:atlas-charter.md#0]
+
+> What is its budget?
+```
+
+"What is its budget?" has one content word. BM25 matches "budget" against every
+document that mentions one, the embedding has almost nothing to work with, and
+the relational tier finds no seed because the question names no entity. The
+result is not a worse answer — it is evidence about the wrong subject, or on a
+small corpus no evidence at all. There is a test that states exactly that: the
+follow-up fails with `no evidence retrieved`, and the retriever's log shows it
+was asked for the question verbatim.
+
+`dispatch chat` fixes it **in the query, not in the prompt**. Stuffing the
+history into the generation prompt would leave retrieval still fetching the
+wrong chunks and merely give the model a better chance of noticing.
+
+```bash
+dispatch chat --index .dispatch/index.json
+```
+
+`agent.Session` holds the conversation and `agent.Condenser` restates a
+follow-up as a standalone question before it reaches the loop. History lives on
+the Session rather than the Loop, because a Loop is per-question and safe to
+share; a conversation is not.
+
+Four things keep it from making questions worse:
+
+- **It only fires on questions that look dependent.** A pronoun, a leading
+  conjunction, "what about ...", or three words or fewer. A false negative costs
+  nothing a Session-less run would not also cost — the question retrieves as
+  written — while calling the model on every self-contained question costs a
+  call per turn forever. `--always-rewrite` opts into that if your questions are
+  elliptical in ways no lexical rule catches.
+- **A rewrite that starts answering is discarded.** Small models do this: asked
+  to make a follow-up standalone, they restate the previous answer, and
+  retrieval then matches the answer rather than the question. Anything much
+  longer than the question is dropped.
+- **A failed rewrite costs the improvement, not the answer.** The original
+  question is used, which is the behaviour without a Session at all.
+- **The rewrite is always shown.** `(searched as: ...)` prints without
+  `--trace`, and the trace records both questions. A question silently searched
+  as something else is the one thing about this mode you cannot infer from the
+  output — and it is where it goes wrong.
+
+`--no-rewrite` keeps the history and disables the rewriting, which is how to see
+what the rewriting actually buys on your corpus rather than on this one.
+
 ### Machine-readable output
 
 ```bash
@@ -485,6 +646,31 @@ The index, the entity graph and the memory core block now go through
 target, flush it, rename over. A reader sees the old file or the new one, never
 a half-written one. The regression test asserts the property that matters — a
 write that fails part-way leaves the previous file byte-identical.
+
+**The cache was missed, and it is the worst place to miss.** It still wrote with
+`os.WriteFile`, which opens with `O_TRUNC` and then writes, so a reader arriving
+mid-write sees a prefix and a crash leaves one on disk permanently. A test that
+hammers one key with two writers and four readers caught it immediately:
+
+```
+--- FAIL: TestCacheEntriesAreNeverTorn
+    read a partial cache entry: 0 bytes, want 524288
+```
+
+Zero bytes is the bad case, not the obvious one. `Cache.Get` documents the empty
+string as a *valid hit* — a chunk the model declined to contextualize — so the
+truncation window and a real decision are indistinguishable. A torn context
+sentence is then returned as the situating sentence, embedded into the chunk,
+and indexed for BM25; and because the cache is exactly what a re-ingest trusts
+instead of calling the model, no later ingest ever repairs it.
+
+The vector half was already safe by accident: a truncated JSON array fails to
+decode and is reported as a miss, costing one embedding call. Both now go
+through `atomicfile`.
+
+This mattered enough to fix now because the ingest passes below made it
+reachable rather than theoretical — several goroutines write the cache at once,
+and two of them can want the same key.
 
 Pointing `--corpus` at a repository skips `node_modules`, `.git`, `dist`,
 `vendor`, `build` and similar by default; `--exclude` adds more. Without this a
@@ -592,15 +778,19 @@ that resolve to nothing.
   the content-addressed cache, and `index.Searcher`, the seam a backend swaps at
 - **index/pgvector** — the same tiers over Postgres + pgvector, via
   `database/sql` and no dependency
+- **tiers/sqldb** — the structured tier over a real database, also via
+  `database/sql`; queries run in a read-only transaction, so the guarantee is
+  the server's rather than a regexp's
 - **tiers/** — the four retrievers, plus the entity graph the relational tier
   traverses (`graph.go` builds and canonicalizes it, `coref.go` adjudicates
   which names denote one thing)
 - **router** — LLM classification with a keyword-heuristic fallback
 - **agent** — the loop (`loop.go`), write-back memory (`memory.go`), trace,
   citation verification (`cite.go`), evidence diversity (`diversity.go`),
-  query expansion (`expand.go`)
+  query expansion (`expand.go`), multi-turn follow-ups (`session.go`)
 - **internal/atomicfile** — write-temp-and-rename, so a crash mid-save cannot
-  destroy an index
+  destroy an index or hand back half a cache entry
+- **internal/par** — bounded-concurrency fan-out, shared by every ingest pass
 
 Derived artifacts record the index generation they were built from, so a graph
 or tree that outlives the documents it describes is refused rather than
@@ -882,6 +1072,35 @@ Measured, not guessed:
   text so a bad hypothetical degrades the query rather than replacing it, and
   the expansion reaches only the dense half, since BM25 would treat every
   invented noun as a high-idf term (`core.Query.Embedding` explains that).
+- **The follow-up rewriter's prompt was the bottleneck, not the model.** The
+  first version of `agent.Condenser` described the task and ended with "if the
+  question already stands on its own, reply with it unchanged". Against a real
+  endpoint it resolved **one follow-up in three**: given a conversation about
+  Project Atlas it turned "Who leads it?" into "Who leads Project Atlas?" and
+  left both "What is its budget?" and "and the vendor?" untouched.
+
+  `llama3.2:3b` and `qwen2.5:7b` failed **identically** — same three questions,
+  same two failures. A 2.3x larger model reproducing a failure exactly is not a
+  capacity problem, and that is what pointed at the prompt.
+
+  Making the pronoun rule imperative ("MUST be replaced") and adding four worked
+  examples took it to **five in five**. The examples deliberately name a subject
+  that appears in no corpus here, and the check was repeated against a third
+  unrelated subject, because a prompt whose examples name the same thing the
+  test asks about can pass by copying rather than by generalizing.
+
+  What remains: rewriting an elliptical question can widen it slightly. "and the
+  vendor?" becomes "Which vendor is involved in Project Atlas?", which invents
+  "involved in". That retrieved the right document here, and the alternative —
+  searching for "and the vendor?" — retrieves nothing at all, so it is the
+  better failure. `--no-rewrite` keeps the history and turns the rewriting off,
+  which is how to check that trade on a corpus rather than take it on trust.
+
+  On the bundled corpus only one of the three follow-ups was ever visibly
+  broken, because 18 chunks about one subject means "budget" has exactly one
+  referent whether or not the question names it. **A single-subject corpus hides
+  this failure**, which is worth knowing before concluding that a rewriter is
+  unnecessary.
 - **Ingest is slow on a local thinking model.** Measured on `gemma4:e4b` over
   70 chunks of ~300 tokens:
 
@@ -1180,7 +1399,93 @@ the target orthogonal — so a target that still ranks first can only have been
 lifted lexically. A check that cannot fail looks exactly like a check that
 passes.
 
-`tiers.SQLRunner` is an interface — back it with `database/sql` the same way.
+### The structured tier, over a real database
+
+`tiers.SQLRunner` was an interface with one implementation — `TableRunner`, the
+in-memory CSV runner — and a line in this README promising that "production
+implements `SQLRunner` over `database/sql`". [`tiers/sqldb`](tiers/sqldb) is now
+that implementation, on the same terms as `index/pgvector`: it imports only
+`database/sql`, and the driver is yours.
+
+```go
+import _ "github.com/jackc/pgx/v5/stdlib"
+
+db, _ := sql.Open("pgx", os.Getenv("DATABASE_URL"))
+runner, _ := sqldb.New(sqldb.Config{DB: db, Schema: "billing", RowCounts: true})
+
+loop.Retrievers[core.TierStructured] = tiers.NewStructured(client, runner)
+```
+
+The schema handed to the text-to-SQL prompt is read from `information_schema`
+rather than configured, because a hand-written description drifts: the model
+keeps writing queries against a column renamed a year ago, and the failure looks
+like a bad model. `RowCounts` adds the planner's row estimates, which help it
+choose between similar tables and cost nothing on a large one. `Tables`
+restricts what the model is told exists — a smaller target and a better prompt,
+though not a security boundary.
+
+**The read-only guarantee stops being string matching.** `isReadOnly` scans the
+generated SQL and its own documentation calls it defense in depth rather than
+the primary guard, because it is string matching against an adversary who
+controls the model's input. Every query here runs inside a transaction opened
+with `sql.TxOptions{ReadOnly: true}`, so on Postgres a write is refused **by the
+server**, after any string-level trick has already succeeded:
+
+```
+INSERT INTO ...           -> ERROR: cannot execute INSERT in a read-only transaction (SQLSTATE 25006)
+DROP TABLE ...            -> ERROR: cannot execute DROP TABLE in a read-only transaction (SQLSTATE 25006)
+WITH gone AS (DELETE ...) -> ERROR: cannot execute SELECT in a read-only transaction (SQLSTATE 25006)
+```
+
+The third is the interesting one. A data-modifying CTE starts with `WITH`, keeps
+its dangerous verb nested inside, and is the shape a string scanner is worst at;
+Postgres refuses the whole statement because the CTE makes the *select* itself
+data-modifying. Those statements are passed straight to `Query` in the tests,
+bypassing `isReadOnly` deliberately — the threat model is that the scanner
+already lost.
+
+It is still not a substitute for `GRANT SELECT`. A read-only transaction stops
+writes; only privileges stop *reads* of tables this question had no business
+touching. Use both.
+
+Two more bounds, because a generated query is not a reviewed one: `Timeout`
+(default 30s) means an accidental cartesian product costs a timeout rather than
+a hung agent, and `MaxRows` (default 1000) stops reading rather than truncating
+afterwards, which is the difference between a cap that bounds memory and one
+that does not.
+
+`NULL` renders as `NULL`, distinctly from the empty string. On the test schema a
+vendor whose only invoice has a null total sums to `NULL`, and a model told `0`
+would report that they billed nothing — a different claim from "unknown".
+
+[`tiers/sqldb/integration`](tiers/sqldb/integration) verifies all of this
+against a real server, again as a separate module so pgx never enters
+`go.mod`:
+
+```bash
+docker run -d --name sqldbtest -e POSTGRES_PASSWORD=dispatch \
+    -e POSTGRES_DB=dispatch -p 55433:5432 pgvector/pgvector:pg17
+
+cd tiers/sqldb/integration
+DISPATCH_PG_DSN='postgres://postgres:dispatch@localhost:55433/dispatch?sslmode=disable' \
+    go test -v ./...
+```
+
+9 tests against PostgreSQL 17.10, including six write shapes each refused, real
+`information_schema` introspection with nullability and row estimates, schema
+scoping, NULL/timestamp/boolean rendering, the row cap and the timeout.
+
+**And a negative control, because the read-only test is the kind that passes for
+the wrong reason.** If the role simply lacked privileges, every write would fail
+whether or not the flag was set, and the test would prove nothing about the
+flag. `TestTheSameWritesSucceedWithoutTheReadOnlyFlag` runs the same `INSERT` in
+a transaction differing only in `TxOptions` — it succeeds, so the refusals above
+are the flag and not the role.
+
+The unit tests use a stdlib fake driver that records the `driver.TxOptions` it
+was handed, which proves the read-only transaction was *requested*. Whether a
+server honours the request is exactly what a fake cannot tell you, and is why
+the integration module exists.
 
 ## API changes
 

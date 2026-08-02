@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"github.com/RootControl/dispatch/internal/atomicfile"
 )
 
 // Cache is a content-addressed disk cache for contextual-chunk sentences. Each
@@ -74,14 +76,21 @@ func (c *Cache) Has(key string) bool {
 }
 
 // Put writes a value, creating the cache directory on first use.
+//
+// The write is atomic because a torn text entry cannot be detected downstream.
+// os.WriteFile opens with O_TRUNC and then writes, so a crash or a concurrent
+// writer leaves a prefix — and half a context sentence is a perfectly valid
+// string, so it is returned as a hit, embedded into the chunk, and indexed. An
+// empty read is worse still: Get documents the empty string as a legitimate hit
+// (a chunk the model declined to contextualize), so the truncation window and a
+// real decision are indistinguishable. Neither is recoverable by a later
+// ingest, since the cache is precisely what a re-ingest trusts in place of the
+// model.
 func (c *Cache) Put(key, val string) error {
 	if c == nil {
 		return nil
 	}
-	if err := os.MkdirAll(c.dir, 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(c.path(key), []byte(val), 0o644)
+	return atomicfile.Write(c.path(key), []byte(val), 0o644)
 }
 
 // GetVector returns a cached embedding. A malformed or empty entry is reported
@@ -119,16 +128,17 @@ func (c *Cache) HasVector(key string) bool {
 // purpose: a narrower encoding would make a cached run rank fractionally
 // differently from an uncached one, and reproducible eval numbers are worth
 // more here than disk. Budget roughly 15 KB per chunk at 768 dimensions.
+// A truncated vector is already caught by GetVector's decode, so this is the
+// cheaper half of the problem — but it is written atomically too, because
+// "reported as a miss" still costs an embedding call for every entry a crash
+// happened to be holding open, and the fix is the same one line.
 func (c *Cache) PutVector(key string, v []float64) error {
 	if c == nil {
 		return nil
-	}
-	if err := os.MkdirAll(c.dir, 0o755); err != nil {
-		return err
 	}
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.vecPath(key), data, 0o644)
+	return atomicfile.Write(c.vecPath(key), data, 0o644)
 }

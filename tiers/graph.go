@@ -26,6 +26,13 @@ type Edge struct {
 // Graph is the entity graph. Keys are normalized names; Entity.Name keeps the
 // display form.
 type Graph struct {
+	// SourceGeneration names the index generation this graph was extracted
+	// from. Without it a graph outlives the documents it describes: after
+	// incremental ingest prunes a file, the relational tier keeps citing its
+	// chunks, and citation verification passes them because the marker does
+	// resolve to retrieved evidence — the evidence is what has gone stale.
+	SourceGeneration string `json:"source_generation,omitempty"`
+
 	Entities map[string]Entity `json:"entities"`
 	Edges    []Edge            `json:"edges"`
 	Excerpts map[string]string `json:"excerpts"` // chunk ID -> supporting text

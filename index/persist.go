@@ -22,6 +22,10 @@ type snapshot struct {
 	// snapshot without it simply loads empty, and the next ingest re-derives
 	// every document once — correct, just not free.
 	DocHashes map[string]string `json:"doc_hashes,omitempty"`
+	// SourceGeneration is set on derived artifacts (the RAPTOR tree) and names
+	// the index generation they were built from, so a stale one can be refused
+	// rather than quietly answering from documents the corpus has dropped.
+	SourceGeneration string `json:"source_generation,omitempty"`
 }
 
 // Save writes the index to path, creating parent directories as needed. Chunks
@@ -35,6 +39,8 @@ func (s *Store) Save(path string) error {
 		Chunks:     make([]core.Chunk, 0, len(s.vec.ids)),
 		Vectors:    make([][]float64, 0, len(s.vec.ids)),
 		DocHashes:  maps.Clone(s.docHash),
+
+		SourceGeneration: s.sourceGen,
 	}
 	for i, id := range s.vec.ids {
 		snap.Chunks = append(snap.Chunks, s.chunks[id])
@@ -81,6 +87,7 @@ func (s *Store) Load(path string) error {
 	s.bm = newBM25()
 	s.docHash = map[string]string{}
 	maps.Copy(s.docHash, snap.DocHashes)
+	s.sourceGen = snap.SourceGeneration
 	for i, c := range snap.Chunks {
 		// A snapshot written before Ingest became an upsert can hold the same
 		// chunk twice. Take the first and drop the rest rather than rebuilding

@@ -33,6 +33,9 @@ type Store struct {
 	// a re-ingest can skip documents nothing about which has changed. It is
 	// persisted with the index, because the whole point is to survive a restart.
 	docHash map[string]string
+	// sourceGen is set on derived artifacts: the Generation of the index they
+	// were built from. Empty on a primary index.
+	sourceGen string
 }
 
 // Config configures a Store.
@@ -48,6 +51,8 @@ type Config struct {
 	// Search over-fetches to give it something to work with.
 	Rerank      Reranker
 	Parallelism int // concurrent context-sentence calls; default 4
+	// SourceGen marks this store as derived from another index's Generation.
+	SourceGen string
 }
 
 // New builds a Store from cfg.
@@ -71,7 +76,20 @@ func New(cfg Config) *Store {
 		vec:        &vectorIndex{},
 		bm:         newBM25(),
 		docHash:    map[string]string{},
+		sourceGen:  cfg.SourceGen,
 	}
+}
+
+// EmbedTag reports the embedding-model identity this store was built under,
+// which is half of every vector cache key.
+func (s *Store) EmbedTag() string { return s.opts.EmbedTag }
+
+// SourceGeneration reports the index generation this store was derived from,
+// or "" for a primary index or an artifact written before this existed.
+func (s *Store) SourceGeneration() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sourceGen
 }
 
 // fingerprint hashes everything that determines a document's chunks and their
@@ -472,6 +490,34 @@ func (s *Store) SetReranker(r Reranker) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.opts.Rerank = r
+}
+
+// Generation fingerprints the current chunk set: a hash over every indexed
+// chunk ID and the embedding model behind them.
+//
+// Derived artifacts — the RAPTOR tree, the entity graph — are built from a
+// store and then live in their own files. Nothing connected them back to the
+// index they came from, so after incremental ingest pruned a document the
+// graph still held its chunks and the relational tier still cited them. That
+// citation even passed verification, because the marker resolved to retrieved
+// evidence and the evidence was what had gone stale.
+//
+// An artifact records the generation it was built from; loading it against a
+// different one is an error. Chunk IDs rather than content, because content
+// changes are already caught by the per-document fingerprint that decides
+// whether to re-derive a chunk at all — what this has to catch is chunks
+// appearing and disappearing.
+func (s *Store) Generation() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	h := sha256.New()
+	h.Write([]byte(s.opts.EmbedTag))
+	h.Write([]byte{0})
+	for _, id := range slices.Sorted(maps.Keys(s.chunks)) {
+		h.Write([]byte(id))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 // DocIDs reports the documents currently indexed, sorted. Callers use it to

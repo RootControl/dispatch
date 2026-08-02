@@ -56,6 +56,10 @@ func main() {
 		err = runAsk(os.Args[2:])
 	case "eval":
 		err = runEval(os.Args[2:])
+	case "index":
+		err = runIndex(os.Args[2:])
+	case "cache":
+		err = runCache(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -80,6 +84,10 @@ func usage() {
   dispatch eval answers [--index PATH] [--cases FILE] [-k N] [-v]   # answer quality
   dispatch eval retrieval [--index PATH] [-k N] [--rerank] [-v]     # recall over every chunk
   dispatch eval scale [--sizes N,N,N] [--queries N] [--dims N]      # latency/memory vs corpus size
+  dispatch eval self-check [--index PATH] [-k N]                    # can the eval still fail?
+
+  dispatch index [docs|show ID] [--index PATH]                      # what is actually indexed
+  dispatch cache [gc [--index PATH]...] [--dry-run]                 # cache size and collection
 
 Artifacts live beside their index: --index .dispatch/x.json puts the summary tree
 at .dispatch/x-hierarchy.json and the entity graph at .dispatch/x-graph.json, so
@@ -234,7 +242,20 @@ func runIngest(args []string) error {
 
 	// The tree is opt-in: it costs roughly one LLM call per cluster per level on
 	// top of ingestion, and is only useful for corpus-wide questions.
-	if *hierarchy {
+	// An artifact that already exists is one someone wants kept current. Leaving
+	// it stale is how the relational tier ended up citing pruned documents, so
+	// rebuild it whether or not the flag was passed. Extraction and summaries are
+	// cached by content, so unchanged chunks cost nothing — only what moved.
+	hierarchyExists := fileExists(artifactPath(*indexPath, "hierarchy"))
+	graphExists := fileExists(artifactPath(*indexPath, "graph"))
+	if hierarchyExists && !*hierarchy {
+		fmt.Println("refreshing the existing hierarchy so it matches the new index")
+	}
+	if graphExists && !*graph {
+		fmt.Println("refreshing the existing graph so it matches the new index")
+	}
+
+	if *hierarchy || hierarchyExists {
 		util, utilName, _ := utilityLLM(client)
 		h, hstats, err := tiers.BuildHierarchy(context.Background(), util, store,
 			tiers.HierarchyOptions{
@@ -257,7 +278,7 @@ func runIngest(args []string) error {
 
 	// Also opt-in: extraction is one LLM call per chunk, cached by content hash
 	// so a rebuild over unchanged documents is free.
-	if *graph {
+	if *graph || graphExists {
 		util, utilName, _ := utilityLLM(client)
 		rel, gstats, err := tiers.BuildGraph(context.Background(), util, store, tiers.GraphOptions{
 			Cache:    index.NewCache(defaultCacheDir),
@@ -319,6 +340,7 @@ func runAsk(args []string) error {
 	fs.Var(&filter, "filter", "restrict retrieval to chunks whose metadata matches, e.g. -filter path=docs/* (repeatable)")
 	stream := fs.Bool("stream", false, "print the answer as the model produces it")
 	asJSON := fs.Bool("json", false, "emit the answer, evidence, citations, trace and token usage as JSON")
+	allowStale := fs.Bool("allow-stale", false, "answer from a hierarchy or graph built against a different index")
 	timeout := fs.Duration("timeout", 0, "give up after this long (e.g. 90s, 2m); 0 waits forever")
 	maxCalls := fs.Int("max-calls", 0, "cap the LLM calls one question may make (0 = no cap)")
 	hyde := fs.Bool("hyde", false, "embed a hypothetical answer alongside the query (helps vague questions, costs one call per round)")
@@ -338,12 +360,13 @@ func runAsk(args []string) error {
 	}
 
 	st, err := buildStack(stackOptions{
-		IndexPath: *indexPath,
-		SQLDir:    *sqlDir,
-		MaxHops:   *maxHops,
-		Remember:  *remember,
-		Rerank:    *rerank,
-		RerankLLM: *rerankLLM,
+		IndexPath:  *indexPath,
+		SQLDir:     *sqlDir,
+		MaxHops:    *maxHops,
+		Remember:   *remember,
+		Rerank:     *rerank,
+		RerankLLM:  *rerankLLM,
+		AllowStale: *allowStale,
 	})
 	if err != nil {
 		return err
@@ -622,4 +645,10 @@ func loadCorpus(dir string, extraSkip []string) ([]core.Doc, error) {
 	// Stable order so chunk IDs are reproducible across runs.
 	slices.SortFunc(docs, func(a, b core.Doc) int { return strings.Compare(a.ID, b.ID) })
 	return docs, nil
+}
+
+// fileExists reports whether path is present.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

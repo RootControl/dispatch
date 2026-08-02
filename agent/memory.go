@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,10 +26,11 @@ import (
 // This is the MemGPT/Letta pattern, and it is what makes retrieval improve
 // across questions and sessions instead of starting cold every time.
 type Memory struct {
-	llm      llm.LLM
-	archival *index.Store
-	dir      string
-	budget   int // core block size in characters
+	llm         llm.LLM
+	archival    *index.Store
+	dir         string
+	budget      int // core block size in characters
+	archivalCap int // max archival entries; <0 means unbounded
 
 	mu   sync.Mutex
 	core []CoreEntry
@@ -46,6 +49,15 @@ type MemoryConfig struct {
 	Dir        string  // persistence directory; default .dispatch/memory
 	CoreBudget int     // core block characters; default 2000
 	EmbedTag   string  // embedding-model identity for the archival index
+	// ArchivalLimit caps how many takeaways archival memory holds, oldest
+	// evicted first. Default 1000; a negative value means unbounded.
+	//
+	// Core has always had a byte budget and archival was documented as
+	// unbounded, which is fine for a session and wrong for a process that runs
+	// for weeks: every takeaway is embedded and kept forever, so the store
+	// grows without limit and search over it slows in step. A cap is a worse
+	// answer than summarising old memories and a much better one than none.
+	ArchivalLimit int
 }
 
 // NewMemory builds a Memory. Archival entries are not contextually chunked:
@@ -58,11 +70,15 @@ func NewMemory(cfg MemoryConfig) *Memory {
 	if cfg.CoreBudget <= 0 {
 		cfg.CoreBudget = 2000
 	}
+	if cfg.ArchivalLimit == 0 {
+		cfg.ArchivalLimit = 1000
+	}
 	return &Memory{
-		llm:      cfg.LLM,
-		dir:      cfg.Dir,
-		budget:   cfg.CoreBudget,
-		archival: index.New(index.Config{LLM: cfg.LLM, EmbedTag: cfg.EmbedTag}),
+		llm:         cfg.LLM,
+		dir:         cfg.Dir,
+		budget:      cfg.CoreBudget,
+		archivalCap: cfg.ArchivalLimit,
+		archival:    index.New(index.Config{LLM: cfg.LLM, EmbedTag: cfg.EmbedTag}),
 	}
 }
 
@@ -159,12 +175,46 @@ func (m *Memory) archive(ctx context.Context, e CoreEntry) error {
 	id := fmt.Sprintf("mem-%d", m.seq)
 	m.mu.Unlock()
 
-	_, err := m.archival.Ingest(ctx, []core.Doc{{
+	if _, err := m.archival.Ingest(ctx, []core.Doc{{
 		ID:   id,
 		Text: e.Text,
 		Meta: map[string]string{"added": e.Added.Format(time.RFC3339)},
-	}})
-	return err
+	}}); err != nil {
+		return err
+	}
+	m.trimArchival()
+	return nil
+}
+
+// trimArchival drops the oldest entries once archival passes its cap.
+//
+// Oldest-first by the sequence number in the ID, not by recency of use: the
+// store does not record access, and inventing a heuristic that silently
+// forgets the memory you rely on most is worse than a rule anyone can predict.
+func (m *Memory) trimArchival() {
+	if m.archivalCap < 0 {
+		return
+	}
+	over := m.archival.Len() - m.archivalCap
+	if over <= 0 {
+		return
+	}
+	ids := m.archival.DocIDs()
+	slices.SortFunc(ids, func(a, b string) int { return memSeq(a) - memSeq(b) })
+	if over > len(ids) {
+		over = len(ids)
+	}
+	m.archival.Delete(ids[:over]...)
+}
+
+// memSeq extracts the counter from a "mem-N" archival ID, so entries sort by
+// age rather than lexically — otherwise mem-10 would precede mem-9.
+func memSeq(id string) int {
+	n, err := strconv.Atoi(strings.TrimPrefix(id, "mem-"))
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // CoreBlock renders the always-in-prompt memory. Empty when nothing is

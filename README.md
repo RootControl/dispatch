@@ -139,6 +139,10 @@ dispatch eval answers [--index PATH] [--cases FILE] [-k N] [-v]   # answer quali
 dispatch eval retrieval [--index PATH] [-k N] [--rerank] [--hyde] [-v]  # recall over every chunk
                         [--save FILE] [--baseline FILE] [--label NAME]  # compare runs
 dispatch eval scale [--sizes N,N,N] [--queries N]                 # latency/memory vs corpus size
+dispatch eval self-check [--index PATH] [-k N]                    # can the eval still fail?
+
+dispatch index [docs|show ID] [--index PATH]                      # what is actually indexed
+dispatch cache [gc [--index PATH]...] [--dry-run]                 # cache size and collection
 ```
 
 The hierarchical and relational tiers are opt-in at ingest time because each
@@ -233,6 +237,94 @@ before the budget is applied — so a dropped duplicate frees its slot for
 something distinct rather than having already spent it. **Off by default**: it
 discards retrieved evidence, and doing that silently to someone who did not ask
 is the wrong default.
+
+### Derived artifacts can go stale, and now say so
+
+The graph and the summary tree are separate files built from an index. Nothing
+connected them back to it, so after incremental ingest pruned a document the
+graph still held its chunks and the relational tier still cited them — and
+**citation verification passed those answers**, because the marker did resolve
+to retrieved evidence. The evidence was what had gone.
+
+Each artifact now records the index generation it was built from: a hash over
+the chunk IDs and the embedding model. `ask` refuses a mismatch, `ingest`
+refreshes an artifact that already exists whether or not its flag was passed,
+and `dispatch index` shows the state of both:
+
+```
+$ dispatch index
+generation: 758c07abefa49899
+documents:  6
+chunks:     18  (3.0 per document)
+contextual: 18 of 18 chunks carry a situating sentence
+hierarchy:  .dispatch/index-hierarchy.json — current
+graph:      .dispatch/index-graph.json — STALE, built from 4b1e...; re-run `ingest --graph`
+```
+
+`--allow-stale` answers anyway. An artifact written before stamps existed loads
+with a warning rather than becoming unusable.
+
+### Seeing inside an index
+
+`dispatch index` for the summary above, `index docs` for a per-document chunk
+count, `index show ID` for the chunks themselves — including the situating
+sentence contextual chunking wrote, which is otherwise invisible. "Did my
+document get ingested, and into how many chunks" previously had no answer short
+of asking a question and reading the citations, which conflates a chunking
+problem with a retrieval one.
+
+### Collecting the cache
+
+`.dispatch/cache` is content-addressed and nothing ever removed an entry, so
+every re-chunking, model swap and edited document left its entries behind
+permanently. Context sentences are small; **embeddings are not** — roughly 15 KB
+per chunk at 768 dimensions, which on this repo's own cache is 427 KB of vectors
+against 89 KB of text.
+
+```bash
+dispatch cache                                    # what is in there
+dispatch cache gc --index .dispatch/a.json \
+                 --index .dispatch/b.json --dry-run
+```
+
+Only vectors are collected, and deliberately so. A vector's key is derivable
+from a loaded index — the embedding-model tag plus the exact text embedded — so
+"is this reachable" has an exact answer. Text entries fold in a model tag the
+index does not record, so calling them dead would be a guess, and a wrong guess
+costs an LLM call to undo. Sweeping the expensive half exactly beats sweeping
+both approximately.
+
+**Name every index that shares the cache.** Nothing can detect an omission; the
+cost is bounded (a dropped vector is one embedding call on the next ingest) but
+it is real.
+
+### Archival memory is bounded
+
+Core memory always had a byte budget and evicted into archival; archival itself
+was documented as unbounded. That is fine for a session and wrong for a process
+that runs for weeks, since every takeaway is embedded and kept forever.
+`MemoryConfig.ArchivalLimit` caps it at 1000 entries by default, oldest first,
+with a negative value restoring the old behaviour. Oldest-first rather than
+least-recently-used because the store does not record access, and a heuristic
+that silently forgets the memory you rely on most is worse than a rule you can
+predict.
+
+### Can the eval still fail?
+
+```bash
+dispatch eval self-check
+```
+
+The README has always said the answer eval was checked against negative
+controls before its numbers were believed. That was done once, by hand. It now
+runs: a case with a deliberately wrong `expect_sources` must report a retrieval
+failure, a case demanding an absent fact must report a facts failure and name
+it, and a real source must still pass — because the two negative controls prove
+nothing if the positive one is broken.
+
+It was itself verified by breaking the scorer, which takes the run to 2/3 and a
+non-zero exit. Twice in this repo a test has been found passing while the thing
+it tested was broken; this is the check that would have caught a third.
 
 ### Chunking on markdown headings
 
@@ -509,6 +601,10 @@ that resolve to nothing.
   query expansion (`expand.go`)
 - **internal/atomicfile** — write-temp-and-rename, so a crash mid-save cannot
   destroy an index
+
+Derived artifacts record the index generation they were built from, so a graph
+or tree that outlives the documents it describes is refused rather than
+answering from them.
 - **internal/fake** — scripted LLM + deterministic embedder, so `go test ./...`
   runs offline and free
 

@@ -78,7 +78,8 @@ func BuildHierarchy(ctx context.Context, l llm.LLM, leaves *index.Store, opts Hi
 		return nil, stats, fmt.Errorf("tiers: cannot build a hierarchy over an empty store")
 	}
 
-	nodes := index.New(index.Config{LLM: l, Cache: opts.Cache, EmbedTag: opts.EmbedTag})
+	nodes := index.New(index.Config{LLM: l, Cache: opts.Cache, EmbedTag: opts.EmbedTag,
+		SourceGen: leaves.Generation()})
 	h := &Hierarchical{nodes: nodes}
 
 	// Current level: the text and vectors being clustered. Starts as the leaves.
@@ -250,3 +251,7 @@ func LoadHierarchy(l llm.LLM, path string) (*Hierarchical, error) {
 	}
 	return &Hierarchical{nodes: nodes}, nil
 }
+
+// SourceGeneration reports the index generation this tree was built from, or
+// "" for a tree written before artifacts recorded it.
+func (h *Hierarchical) SourceGeneration() string { return h.nodes.SourceGeneration() }

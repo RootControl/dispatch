@@ -108,6 +108,7 @@ func BuildGraph(ctx context.Context, l llm.LLM, store *index.Store, opts GraphOp
 	}
 
 	g := newGraph()
+	g.SourceGeneration = store.Generation()
 	for _, c := range chunks {
 		stats.Chunks++
 		body := c.Embedded()
@@ -275,6 +276,10 @@ func (r *Relational) Save(path string) error {
 	}
 	return atomicfile.Write(path, data, 0o644)
 }
+
+// SourceGeneration reports the index generation this graph was extracted from,
+// or "" for a graph written before artifacts recorded it.
+func (r *Relational) SourceGeneration() string { return r.graph.SourceGeneration }
 
 // LoadGraph reads a graph written by Save.
 func LoadGraph(path string, maxHops int) (*Relational, error) {

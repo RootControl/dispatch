@@ -92,7 +92,7 @@ func (s *Store) fingerprint(doc core.Doc) string {
 		write(k, doc.Meta[k])
 	}
 	c := s.opts.Chunk.withDefaults()
-	write(fmt.Sprint(c.TargetTokens, c.OverlapTokens, c.MinWords, s.opts.Contextualize),
+	write(fmt.Sprint(c.TargetTokens, c.OverlapTokens, c.MinWords, c.Headings, s.opts.Contextualize),
 		s.opts.CacheTag, s.opts.EmbedTag)
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -365,10 +365,38 @@ func contextMessages(doc core.Doc, chunk string) []llm.Message {
 	}
 }
 
-// Hit is one search result: the matched chunk and its fused RRF score.
+// Hit is one search result: the matched chunk, its fused RRF score, and how it
+// got there.
 type Hit struct {
 	Chunk core.Chunk
 	Score float64
+	// VectorRank and TextRank are the 1-based positions this chunk held in the
+	// cosine and BM25 candidate lists, or 0 when that half did not return it.
+	//
+	// They answer the first question anyone asks of a hybrid index: did this
+	// come back because the embedding matched, because the terms matched, or
+	// because both did? The fused score cannot say — two chunks scoring almost
+	// identically can have arrived for entirely different reasons. A chunk with
+	// TextRank 1 and VectorRank 0 is a lexical hit on a rare term; one ranked
+	// mid-list by both is a weak agreement, and the difference matters when
+	// deciding whether a corpus needs better chunking or a reranker.
+	VectorRank, TextRank int
+}
+
+// Sources renders the provenance for a trace line: "vec#3 text#1", or "vec#3"
+// when only one half found it.
+func (h Hit) Sources() string {
+	var parts []string
+	if h.VectorRank > 0 {
+		parts = append(parts, fmt.Sprintf("vec#%d", h.VectorRank))
+	}
+	if h.TextRank > 0 {
+		parts = append(parts, fmt.Sprintf("text#%d", h.TextRank))
+	}
+	if len(parts) == 0 {
+		return "reranked"
+	}
+	return strings.Join(parts, " ")
 }
 
 // Searcher is the retrieval half of a store: the surface the semantic tier and
@@ -420,10 +448,17 @@ func (s *Store) Search(ctx context.Context, q core.Query) ([]Hit, error) {
 	if s.opts.Rerank != nil {
 		fuseTo = max(topK*4, 20)
 	}
-	fused := fuseRRF([][]scored{vecHits, bmHits}, 60, fuseTo)
-	out := make([]Hit, 0, len(fused))
-	for _, f := range fused {
-		out = append(out, Hit{Chunk: s.chunks[f.id], Score: f.score})
+	// Order matters: index 0 is the cosine list and index 1 the BM25 one, which
+	// is what Hit.VectorRank and Hit.TextRank read back out.
+	ranked := fuseRRF([][]scored{vecHits, bmHits}, 60, fuseTo)
+	out := make([]Hit, 0, len(ranked))
+	for _, f := range ranked {
+		out = append(out, Hit{
+			Chunk:      s.chunks[f.id],
+			Score:      f.score,
+			VectorRank: f.ranks[0],
+			TextRank:   f.ranks[1],
+		})
 	}
 	if s.opts.Rerank != nil {
 		return s.opts.Rerank.Rerank(ctx, q.Text, out, topK)

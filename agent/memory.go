@@ -12,6 +12,7 @@ import (
 
 	"github.com/RootControl/dispatch/core"
 	"github.com/RootControl/dispatch/index"
+	"github.com/RootControl/dispatch/internal/atomicfile"
 	"github.com/RootControl/dispatch/llm"
 )
 
@@ -252,7 +253,7 @@ func (m *Memory) Save() error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(m.dir, "core.json"), data, 0o644); err != nil {
+	if err := atomicfile.Write(filepath.Join(m.dir, "core.json"), data, 0o644); err != nil {
 		return err
 	}
 	// An empty archival index has nothing worth writing.

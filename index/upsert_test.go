@@ -231,6 +231,7 @@ func TestFingerprintCoversSettings(t *testing.T) {
 		"chunk size":    fp(func(c *Config) { c.Chunk.TargetTokens = 42 }, nopDoc),
 		"overlap":       fp(func(c *Config) { c.Chunk.OverlapTokens = 42 }, nopDoc),
 		"min words":     fp(func(c *Config) { c.Chunk.MinWords = 5 }, nopDoc),
+		"headings":      fp(func(c *Config) { c.Chunk.Headings = true }, nopDoc),
 		"contextualize": fp(func(c *Config) { c.Contextualize = true }, nopDoc),
 		"context model": fp(func(c *Config) { c.CacheTag = "c2" }, nopDoc),
 		"embed model":   fp(func(c *Config) { c.EmbedTag = "e2" }, nopDoc),

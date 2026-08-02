@@ -2,6 +2,7 @@ package index
 
 import (
 	"math"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -18,8 +19,27 @@ func TestFuseRRF(t *testing.T) {
 		t.Fatalf("top score = %v, want %v", got[0].score, wantX)
 	}
 	if got[0].id != "x" || got[1].id != "y" || got[2].id != "z" {
-		t.Fatalf("order = %v, want [x y z]", ids(got))
+		t.Fatalf("order = %v, want [x y z]", fusedIDs(got))
 	}
+
+	// Provenance rides along with the score, which is what tells a reader why a
+	// chunk is here. x and y placed in both lists at different positions; z
+	// only in the first, so its second slot is 0 — "that list did not return
+	// it", which is exactly the distinction the fused score cannot express.
+	want := map[string][]int{"x": {1, 2}, "y": {2, 1}, "z": {3, 0}}
+	for _, f := range got {
+		if !slices.Equal(f.ranks, want[f.id]) {
+			t.Errorf("%s ranks = %v, want %v", f.id, f.ranks, want[f.id])
+		}
+	}
+}
+
+func fusedIDs(f []fused) []string {
+	out := make([]string, len(f))
+	for i, x := range f {
+		out[i] = x.id
+	}
+	return out
 }
 
 func TestBM25RanksExactTermMatch(t *testing.T) {

@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"path/filepath"
 
 	"github.com/RootControl/dispatch/core"
+	"github.com/RootControl/dispatch/internal/atomicfile"
 )
 
 // snapshot is the on-disk index format. Only chunks and vectors are stored; the
@@ -41,19 +41,14 @@ func (s *Store) Save(path string) error {
 		snap.Vectors = append(snap.Vectors, s.vec.vecs[i])
 	}
 
-	if dir := filepath.Dir(path); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	return enc.Encode(snap)
+	// Atomic: a crash part-way through an os.Create would leave truncated JSON
+	// with the previous good index already gone, and since ingest became
+	// incremental that index is the only record of what has been embedded.
+	return atomicfile.WriteFunc(path, 0o644, func(f *os.File) error {
+		enc := json.NewEncoder(f)
+		enc.SetIndent("", "  ")
+		return enc.Encode(snap)
+	})
 }
 
 // Load replaces the store's contents with the index at path and rebuilds the

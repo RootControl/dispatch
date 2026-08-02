@@ -126,17 +126,18 @@ questions about how things relate. Skip it if you only need content lookup.
 
 ```
 dispatch ingest --corpus DIR [--index PATH] [--dry-run] [--no-context] [--full]
-                [--chunk-tokens N] [--min-words N] [--exclude DIRS]
+                [--chunk-tokens N] [--min-words N] [--headings] [--exclude DIRS]
                 [--hierarchy] [--graph] [--utility-model NAME]
 
 dispatch ask [--index PATH] [--trace] [-k N] [--max-steps N] [--llm-router]
              [--remember] [--sql-dir DIR] [--max-hops N] [--filter K=V]
-             [--rerank] [--retrieve-only] [--stream] [--diverse] [--per-doc N]
-             [--hyde] [--timeout D] [--max-calls N] "question"
+             [--rerank] [--retrieve-only] [--stream] [--json] [--diverse]
+             [--per-doc N] [--hyde] [--timeout D] [--max-calls N] "question"
 
 dispatch eval [--router heuristic|llm|both] [--cases FILE] [-v]   # routing accuracy
 dispatch eval answers [--index PATH] [--cases FILE] [-k N] [-v]   # answer quality
 dispatch eval retrieval [--index PATH] [-k N] [--rerank] [--hyde] [-v]  # recall over every chunk
+                        [--save FILE] [--baseline FILE] [--label NAME]  # compare runs
 dispatch eval scale [--sizes N,N,N] [--queries N]                 # latency/memory vs corpus size
 ```
 
@@ -233,6 +234,71 @@ something distinct rather than having already spent it. **Off by default**: it
 discards retrieved evidence, and doing that silently to someone who did not ask
 is the wrong default.
 
+### Chunking on markdown headings
+
+`--headings` splits on markdown headings before paragraphs, so a chunk never
+spans two sections, and prefixes each chunk with its heading path:
+
+```
+Atlas > Budget > Contingency
+
+The reserve stands at twelve percent of the approved figure.
+```
+
+That prefix is the point. It gives the embedder and BM25 the same kind of
+situating signal that contextual chunking pays an LLM call per chunk to write —
+except this one is free, exact, and already in the document. The two compose.
+Headings inside fenced code blocks are ignored, because a shell comment starts
+with `#` and splitting a code block in half is worse than not splitting at all.
+
+**The measurement is confounded and should not be read as a 27-point win.** On
+the bundled corpus recall@1 went 50% → 77% and recall@5 94% → 95% — but the same
+change took 18 chunks to 22, and this eval writes one question per chunk *from
+that chunk alone*. Smaller chunks get more specific questions, which are easier
+to retrieve, so any split that produces more chunks tends to score better
+whether or not retrieval improved. `eval retrieval --baseline` now says so
+itself rather than printing a clean table of per-chunk deltas across two
+different chunkings. Treat `--headings` as well-motivated and unproven; it is
+off by default, and turning it on is a re-ingest.
+
+### Comparing two eval runs
+
+```bash
+dispatch eval retrieval -k 5 --label none --save runs/none.json
+dispatch eval retrieval -k 5 --rerank --label cross-encoder --baseline runs/none.json
+```
+
+```
+=== vs none ===
+recall@1  35/65 (53%) -> 48/65 (73%)   +13
+recall@5  65/65 (100%) -> 63/65 (96%)   -2
+
+chunks improved: 13, regressed: 2, unchanged: 50
+
+regressed:
+  README.zh.md#0                     #1 -> miss
+  AGENTS.md#0                        #2 -> miss
+```
+
+Two aggregate figures cannot show that a change gained thirteen chunks and lost
+two — every reranker comparison in this repo's history was done by eyeballing
+recall numbers and diffing miss lists by hand. It also refuses to mislead: it
+warns when the two runs used different `k`, covered different chunks, or hold
+different text under the same chunk ID. That last check exists because the tool
+got it wrong on its first real use, confidently reporting per-chunk deltas
+across a re-chunking where the IDs matched and the content did not.
+
+### Machine-readable output
+
+```bash
+dispatch ask --json "what is the budget?" | jq '.citations.ok'
+```
+
+One object: the answer, the evidence with per-chunk provenance, the citation
+report, the trace, and token usage. `citations.ok` is the field worth wiring
+into CI — it fails a build on a fabricated source, which is not something a
+person will catch by reading answers.
+
 ### Citations are checked before you see the answer
 
 Every `[tier:source]` marker in a generated answer is resolved against the
@@ -294,6 +360,39 @@ reads as free:
 rounds: 1, llm calls: 2
 tokens: 1509 prompt + 64 completion = 1573 over 2 call(s)
 ```
+
+### Why did that chunk come back?
+
+Hybrid retrieval fuses a cosine list and a BM25 list, and the fused score cannot
+say which one found a given chunk — two chunks scoring almost identically can
+have arrived for completely different reasons. `ask --retrieve-only --trace`
+shows the rank each half gave it:
+
+```
+[semantic:atlas-vendor-assessment.md#0]  (vec#1 text#1)   both halves agreed
+[semantic:atlas-vendor-assessment.md#1]  (vec#6 text#2)   mostly lexical
+[semantic:atlas-charter.md#3]            (vec#3 text#9)   mostly dense
+```
+
+`index.Hit` carries `VectorRank` and `TextRank` for library callers, `0` meaning
+that half did not return it. This is the difference between "the corpus needs
+better chunking" and "the corpus needs a reranker", and it was previously
+invisible — isolating the lexical half in the pgvector integration tests took
+three attempts and elaborate scaffolding purely because the store would not say.
+
+### Writes are atomic
+
+Saving an index used to `os.Create` it, which truncates before the first byte of
+the new file is written. A crash, a kill, or a full disk part-way through left
+truncated JSON *and* the previous good copy already gone — and since ingest
+became incremental, that index is the only record of which documents have been
+embedded, so losing it means paying to embed the corpus again.
+
+The index, the entity graph and the memory core block now go through
+[`internal/atomicfile`](internal/atomicfile): write a temporary file beside the
+target, flush it, rename over. A reader sees the old file or the new one, never
+a half-written one. The regression test asserts the property that matters — a
+write that fails part-way leaves the previous file byte-identical.
 
 Pointing `--corpus` at a repository skips `node_modules`, `.git`, `dist`,
 `vendor`, `build` and similar by default; `--exclude` adds more. Without this a
@@ -408,6 +507,8 @@ that resolve to nothing.
 - **agent** — the loop (`loop.go`), write-back memory (`memory.go`), trace,
   citation verification (`cite.go`), evidence diversity (`diversity.go`),
   query expansion (`expand.go`)
+- **internal/atomicfile** — write-temp-and-rename, so a crash mid-save cannot
+  destroy an index
 - **internal/fake** — scripted LLM + deterministic embedder, so `go test ./...`
   runs offline and free
 
@@ -1001,8 +1102,10 @@ chat-model reranker moved to `--rerank-llm`. Saved indexes load unchanged: one
 written before this carries no document fingerprints, so the next ingest
 re-derives each document once and is incremental from then on.
 
-`agent.Answer` gained `Citations`, and `Loop` gained `CitationPolicy`,
-`Diversity`, `Expander`, `MaxCalls` and `OnDelta` — all zero-valued to the
+`index.Hit` gained `VectorRank` and `TextRank` (both zero-valued when a half did
+not return the chunk), `index.ChunkOptions` gained `Headings`, and
+`index.Ranked` gained `Ranks`. `agent.Answer` gained `Citations`, and `Loop`
+gained `CitationPolicy`, `Diversity`, `Expander`, `MaxCalls` and `OnDelta` — all zero-valued to the
 previous behaviour, except citation verification, which now always runs and
 populates `Answer.Citations` (it changes no text under the default policy).
 `extractCitations` moved from the eval to `agent.ExtractCitations`.

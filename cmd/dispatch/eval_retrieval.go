@@ -46,6 +46,9 @@ func evalRetrieval(args []string) error {
 	rerank := fs.Bool("rerank", false, "rescore the shortlist with a cross-encoder before measuring (needs RERANK_BASE_URL)")
 	rerankLLM := fs.Bool("rerank-llm", false, "rescore with the chat model instead — measured worse than no reranking")
 	hyde := fs.Bool("hyde", false, "embed a hypothetical answer alongside each probe (one call per chunk)")
+	save := fs.String("save", "", "write this run's per-chunk ranks here, for a later --baseline")
+	baseline := fs.String("baseline", "", "compare against a run saved with --save")
+	label := fs.String("label", "", "name this run in comparison output (e.g. \"bge-reranker-base\")")
 	verbose := fs.Bool("v", false, "show every probe, not just misses")
 	questionsPath := fs.String("questions", "", "write the generated questions here, as answer-eval cases")
 	jobs := fs.Int("jobs", defaultJobs, "chunks to probe concurrently")
@@ -124,6 +127,8 @@ func evalRetrieval(args []string) error {
 	})
 
 	var probed, hitAt1, hitAtK, generated, cached, skipped int
+	ranks := make(map[string]int, len(chunks))
+	texts := make(map[string]string, len(chunks))
 	var misses []string
 	var cases []answerCase
 	for i, p := range probes {
@@ -135,6 +140,8 @@ func evalRetrieval(args []string) error {
 		if p.err != nil {
 			return p.err
 		}
+		ranks[c.ID] = p.rank
+		texts[c.ID] = chunkDigest(c.Embedded())
 		if p.fresh {
 			generated++
 		} else {
@@ -178,6 +185,26 @@ func evalRetrieval(args []string) error {
 	fmt.Printf("\nquestions: %d generated, %d from cache\n", generated, cached)
 	fmt.Printf("recall@1:  %d/%d (%.0f%%)\n", hitAt1, probed, 100*float64(hitAt1)/float64(probed))
 	fmt.Printf("recall@%d:  %d/%d (%.0f%%)\n", *topK, hitAtK, probed, 100*float64(hitAtK)/float64(probed))
+
+	run := retrievalRun{Label: *label, TopK: *topK, Ranks: ranks, Texts: texts}
+	if run.Label == "" {
+		run.Label = fmt.Sprintf("rerank=%s hyde=%v k=%d", rerankLabel(*rerank, *rerankLLM), *hyde, *topK)
+	}
+	// Compare before saving, so `--save x --baseline x` diffs against the
+	// previous run rather than against what this one just wrote.
+	if *baseline != "" {
+		base, err := loadRun(*baseline)
+		if err != nil {
+			return err
+		}
+		compareRuns(base, run)
+	}
+	if *save != "" {
+		if err := saveRun(*save, run); err != nil {
+			return err
+		}
+		fmt.Printf("\nsaved %d per-chunk ranks to %s\n", len(ranks), *save)
+	}
 
 	if *questionsPath != "" {
 		if err := writeCases(*questionsPath, cases); err != nil {

@@ -44,7 +44,10 @@ func (s *Semantic) Retrieve(ctx context.Context, q core.Query) ([]core.Result, e
 			SourceID: h.Chunk.ID,
 			Text:     h.Chunk.Embedded(),
 			Score:    h.Score,
-			Meta:     map[string]string{"doc": h.Chunk.DocID},
+			// "sources" carries which half of the hybrid found this chunk, so a
+			// trace can show it. It is metadata rather than a typed field
+			// because core.Result is shared by tiers that have no such notion.
+			Meta: map[string]string{"doc": h.Chunk.DocID, "sources": h.Sources()},
 		})
 	}
 	return out, nil

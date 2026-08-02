@@ -120,7 +120,7 @@ var utilityOverride string
 
 // newStore wires an index.Store to the configured endpoint. Cache and index are
 // tagged with the model names so swapping models invalidates derived data.
-func newStore(contextualize bool, chunkTokens, minWords int) (*index.Store, *llm.Client, error) {
+func newStore(contextualize bool, chunkTokens, minWords int, headings bool) (*index.Store, *llm.Client, error) {
 	client, err := llm.New(llm.Config{})
 	if err != nil {
 		return nil, nil, err
@@ -136,7 +136,7 @@ func newStore(contextualize bool, chunkTokens, minWords int) (*index.Store, *llm
 		// them rather than silently reuse another model's work.
 		CacheTag: utilName,
 		EmbedTag: client.EmbedModel(),
-		Chunk:    index.ChunkOptions{TargetTokens: chunkTokens, MinWords: minWords},
+		Chunk:    index.ChunkOptions{TargetTokens: chunkTokens, MinWords: minWords, Headings: headings},
 	})
 	return s, client, nil
 }
@@ -149,6 +149,7 @@ func runIngest(args []string) error {
 	noContext := fs.Bool("no-context", false, "skip contextual chunking (cheaper, worse retrieval)")
 	chunkTokens := fs.Int("chunk-tokens", 0, "target chunk size in tokens (0 = default 800)")
 	minWords := fs.Int("min-words", 0, "skip chunks with fewer prose words than this (0 = keep all)")
+	headings := fs.Bool("headings", false, "split on markdown headings and prefix each chunk with its heading path")
 	hierarchy := fs.Bool("hierarchy", false, "also build the RAPTOR summary tree for the hierarchical tier")
 	branching := fs.Int("branching", 5, "leaves per cluster when building the hierarchy")
 	graph := fs.Bool("graph", false, "also build the entity graph for the relational tier")
@@ -168,7 +169,7 @@ func runIngest(args []string) error {
 		return fmt.Errorf("no .md or .txt files under %s", *corpus)
 	}
 
-	store, client, err := newStore(!*noContext, *chunkTokens, *minWords)
+	store, client, err := newStore(!*noContext, *chunkTokens, *minWords, *headings)
 	if err != nil {
 		return err
 	}
@@ -317,6 +318,7 @@ func runAsk(args []string) error {
 	var filter filterFlag
 	fs.Var(&filter, "filter", "restrict retrieval to chunks whose metadata matches, e.g. -filter path=docs/* (repeatable)")
 	stream := fs.Bool("stream", false, "print the answer as the model produces it")
+	asJSON := fs.Bool("json", false, "emit the answer, evidence, citations, trace and token usage as JSON")
 	timeout := fs.Duration("timeout", 0, "give up after this long (e.g. 90s, 2m); 0 waits forever")
 	maxCalls := fs.Int("max-calls", 0, "cap the LLM calls one question may make (0 = no cap)")
 	hyde := fs.Bool("hyde", false, "embed a hypothetical answer alongside the query (helps vague questions, costs one call per round)")
@@ -328,6 +330,11 @@ func runAsk(args []string) error {
 	question := strings.Join(fs.Args(), " ")
 	if question == "" {
 		return fmt.Errorf("ask what? provide a question")
+	}
+	if *asJSON && *stream {
+		// Streaming writes fragments to stdout as they arrive, which would
+		// interleave with the JSON object and produce neither.
+		return fmt.Errorf("--json and --stream both write to stdout; choose one")
 	}
 
 	st, err := buildStack(stackOptions{
@@ -399,7 +406,16 @@ func runAsk(args []string) error {
 			}
 			return fmt.Errorf("no evidence retrieved from %d indexed chunks", store.Len())
 		}
-		fmt.Println(agent.FormatEvidence(evidence))
+		// --retrieve-only exists to inspect retrieval, so show why each chunk is
+		// here rather than only that it is.
+		for _, e := range evidence {
+			if src := e.Meta["sources"]; src != "" && *trace {
+				fmt.Printf("%s  (%s)\n", e.Cite(), src)
+			} else {
+				fmt.Println(e.Cite())
+			}
+			fmt.Printf("%s\n\n", strings.TrimSpace(e.Text))
+		}
 		return nil
 	}
 
@@ -439,6 +455,12 @@ func runAsk(args []string) error {
 			return fmt.Errorf("save memory: %w", err)
 		}
 	}
+	if *asJSON {
+		// Everything goes in the object, including the citation warning, so a
+		// consumer never has to parse stderr to learn the answer is unsound.
+		return writeJSON(os.Stdout, buildAskResult(question, answer, client.Usage()))
+	}
+
 	// When streaming, the answer already went to stdout fragment by fragment.
 	// Printing answer.Text as well would double it.
 	if *stream {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/RootControl/dispatch/core"
 	"github.com/RootControl/dispatch/index"
+	"github.com/RootControl/dispatch/internal/atomicfile"
 	"github.com/RootControl/dispatch/llm"
 )
 
@@ -272,7 +273,7 @@ func (r *Relational) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return atomicfile.Write(path, data, 0o644)
 }
 
 // LoadGraph reads a graph written by Save.
